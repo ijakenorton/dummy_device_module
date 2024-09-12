@@ -1,4 +1,5 @@
 obj-m	+= gpio.o
+obj-m	+= asgn2.o
 
 KDIR	:= /lib/modules/$(shell uname -r)/build
 PWD	:= $(shell pwd)

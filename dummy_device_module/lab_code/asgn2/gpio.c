@@ -17,6 +17,7 @@
  * 2 of the License, or (at your option) any later version.
  */
 
+#include "linux/printk.h"
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/gpio.h>
@@ -52,12 +53,8 @@ static struct gpio gpio_dummy[] = {
 	{ 539, GPIOF_IN, "GPIO27" },
 };
 static int dummy_irq;
-extern irqreturn_t dummyport_interrupt(int irq, void *dev_id);
 
-extern irqreturn_t dummyport_interrupt(int irq, void *dev_id)
-{
-	return IRQ_NONE;
-}
+extern irqreturn_t dummyport_interrupt(int irq, void *dev_id);
 
 static inline u32 gpio_inw(u32 addr)
 {
@@ -142,6 +139,46 @@ static void write_to_gpio(char c)
 	udelay(1);
 }
 
+static u8 one_byte = 0;
+static bool first_half = true;
+#define BUF_SIZE 1000
+typedef struct {
+	char *read;
+	char *write;
+	char buf[BUF_SIZE];
+} ringbuffer_t;
+
+void printbits(u8 byte)
+{
+	char bits[9] = { 0 }; // 8 bits + null terminator
+	for (int i = 7; i >= 0; i--) {
+		bits[7 - i] = ((byte >> i) & 1) ? '1' : '0';
+	}
+	pr_info("bits: %s", bits);
+}
+
+irqreturn_t dummyport_interrupt(int irq, void *dev_id)
+{
+	u8 half = read_half_byte();
+
+	if (first_half) {
+		one_byte = half
+			   << 4; // Store the first half in the upper 4 bits
+		first_half = false;
+	} else {
+		one_byte |=
+			half; // Combine with the second half in the lower 4 bits
+		pr_info("Combined byte: 0x%02X ('%c')", one_byte,
+			(one_byte >= 32 && one_byte <= 126) ? one_byte : '.');
+		/* printbits(one_byte); */
+		// Reset for the next byte
+		first_half = true;
+		one_byte = 0;
+	}
+
+	return IRQ_HANDLED;
+}
+
 int __init gpio_dummy_init(void)
 {
 	int ret;
@@ -168,6 +205,8 @@ int __init gpio_dummy_init(void)
 
 	ret = request_irq(dummy_irq, dummyport_interrupt,
 			  IRQF_TRIGGER_RISING | IRQF_ONESHOT, "gpio27", NULL);
+
+	pr_warn("ret = %d", ret);
 
 	if (ret) {
 		printk(KERN_ERR "Unable to request IRQ for dummy device: %d\n",
