@@ -170,8 +170,6 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id)
 			half; // Combine with the second half in the lower 4 bits
 		pr_info("Combined byte: 0x%02X ('%c')", one_byte,
 			(one_byte >= 32 && one_byte <= 126) ? one_byte : '.');
-		/* printbits(one_byte); */
-		// Reset for the next byte
 		first_half = true;
 		one_byte = 0;
 	}
