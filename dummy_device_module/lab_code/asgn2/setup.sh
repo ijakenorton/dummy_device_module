@@ -8,11 +8,12 @@ module_name="$1"
 make && \
 sudo dmesg -C
 sudo insmod "./$module_name.ko" && \
+sudo chown pi:pi /dev/asgn2
 
 echo "Setup $module_name successfully."
 
 # sudo ./data_generator ./asgn2.c
-sudo rmmod gpio
+# sudo rmmod gpio
 # sudo chown pi:pi /dev/"$module_name"
 
 # Check the exit status of the last command
