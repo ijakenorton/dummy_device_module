@@ -1,63 +1,32 @@
-/**
- * File: asgn2.c
- * Date: 08/08/2024
- * Author: Jake Norton
- * Version: 0.1
- *
- * This is a module which serves as a virtual ramdisk which disk size is
- * limited by the amount of memory available and serves as the requirement for
- * COSC440 assignment 1. This template is provided to students for their 
- * convenience and served as hints/tips, but not necessarily as a standard
- * answer for the assignment. So students are free to change any part of
- * the template to fit their design, not the other way around. 
- *
- * Note: multiple devices and concurrent modules are not supported in this
- *       version. The template is 
- */
 
-/* This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
- */
-
-#include <linux/gpio.h>
-#include <linux/interrupt.h>
-#include "asm/page.h"
-#include "linux/atomic/atomic-instrumented.h"
-#include "linux/device/class.h"
-#include "linux/err.h"
-#include "linux/gfp.h"
-#include "linux/kern_levels.h"
-#include "linux/printk.h"
-#include <linux/module.h>
-#include <linux/fs.h>
-#include <linux/cdev.h>
-#include <linux/list.h>
-#include <linux/uaccess.h>
-#include <linux/slab.h>
-#include <linux/mm.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/device.h>
-#include <linux/sched.h>
-
+#define BUF_SIZE 2000
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
 #define MYIOC_TYPE 'k'
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jake Norton");
-MODULE_DESCRIPTION("COSC440 asgn2");
+#include <linux/printk.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/proc_fs.h>
+#include <linux/gpio.h>
+#include <linux/mm.h>
+#include <linux/cdev.h>
+#include <linux/seq_file.h>
+#include <linux/interrupt.h>
+#include <linux/version.h>
+#include <linux/delay.h>
+#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
+#include <asm/switch_to.h>
+#else
+#include <asm/system.h>
+#endif
 
-/**
- * The node structure for the memory page linked list.
- */
 typedef struct page_node_rec {
 	struct list_head list;
 	struct page *page;
+	int data_size;
 } page_node;
 
-typedef struct asgn2_dev_t {
+typedef struct gpio_dev_t {
 	dev_t dev; /* the device */
 	struct cdev cdev;
 	struct list_head mem_list;
@@ -68,29 +37,13 @@ typedef struct asgn2_dev_t {
 	struct kmem_cache *cache; /* cache memory */
 	struct class *class; /* the udev class */
 	struct device *device; /* the udev device node */
-} asgn2_dev;
-
-struct proc_dir_entry *entry;
-asgn2_dev asgn2_device;
+} gpio_dev;
 
 int asgn2_major = 0; /* major number of module */
 int asgn2_minor = 0; /* minor number of module */
 int asgn2_dev_count = 1; /* number of devices */
-
-/* static void data_transfer(unsigned long t_arg) */
-/* { */
-/* 	struct simp *datum; */
-/* 	datum = (struct simp *)t_arg; */
-/* 	printk(KERN_INFO "I am in t_fun, jiffies = %ld\n", jiffies); */
-/* 	printk(KERN_INFO " I think my current task pid is %d\n", */
-/* 	       (int)current->pid); */
-/* 	printk(KERN_INFO " my data is: %d\n", datum->len); */
-/* } */
-
-/* static DECLARE_TASKLET_OLD(device_tasklet, data_transfer); */
-/**
- * This function frees all memory pages held by the module.
- */
+struct proc_dir_entry *entry;
+gpio_dev asgn2_device;
 
 void free_memory_pages(void)
 {
@@ -109,11 +62,6 @@ void free_memory_pages(void)
 	asgn2_device.data_size = 0;
 	asgn2_device.num_pages = 0;
 }
-
-/**
- * This function opens the virtual disk, if it is opened in the write-only
- * mode, all memory pages will be freed.
- */
 int asgn2_open(struct inode *inode, struct file *filp)
 {
 	/* Increment process count, if exceeds max_nprocs, return -EBUSY */
@@ -219,37 +167,6 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	pr_info("Finished read successfully after reading %d", size_read);
 
 	return size_read;
-}
-
-static loff_t asgn2_lseek(struct file *file, loff_t offset, int cmd)
-{
-	loff_t test_pos = 0;
-	size_t buffer_size = asgn2_device.num_pages * PAGE_SIZE;
-
-	switch (cmd) {
-	case SEEK_SET:
-		test_pos = offset;
-		break;
-	case SEEK_CUR:
-		test_pos = file->f_pos + offset;
-		break;
-	case SEEK_END:
-		test_pos = buffer_size + offset;
-		break;
-	default:
-		return -EINVAL;
-	}
-	if (test_pos < 0) {
-		return -EINVAL;
-	}
-
-	if (test_pos > buffer_size) {
-		test_pos = buffer_size;
-	}
-
-	file->f_pos = test_pos;
-
-	return test_pos;
 }
 
 /**
@@ -364,8 +281,6 @@ ssize_t asgn2_write(struct file *filp, const char __user *buf, size_t count,
 }
 
 #define SET_NPROC_OP 1
-#define SET_MMAP_OP 2
-#define MMAP_DEV_CMD_GET_BUFSIZE _IOW(MYIOC_TYPE, SET_MMAP_OP, int)
 #define TEM_SET_NPROC _IOW(MYIOC_TYPE, SET_NPROC_OP, int)
 
 long asgn2_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
@@ -390,64 +305,15 @@ long asgn2_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
 		}
 		atomic_set(&asgn2_device.max_nprocs, new_max_nprocs);
 		return 0;
-	case MMAP_DEV_CMD_GET_BUFSIZE:
-		if (!access_ok((void __user *)arg,
-			       sizeof(asgn2_device.data_size)))
-			return -EINVAL;
-		if (put_user(asgn2_device.data_size, (size_t __user *)arg)) {
-			return -EFAULT;
-		}
-		return 0;
 	}
 	return -ENOTTY;
 }
-
-static int asgn2_mmap(struct file *filp, struct vm_area_struct *vma)
-{
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
-	unsigned long len = vma->vm_end - vma->vm_start;
-	unsigned long ramdisk_size = asgn2_device.num_pages * PAGE_SIZE;
-	unsigned long index;
-	unsigned long begin_page_no = offset / PAGE_SIZE;
-	unsigned long pages_to_map = (len + PAGE_SIZE - 1) / PAGE_SIZE;
-	page_node *curr;
-	/* check offset and len */
-	if (offset + len > ramdisk_size) {
-		pr_warn("Offset + length are out of bounds\n");
-		return -EINVAL;
-	}
-	struct list_head *ptr = asgn2_device.mem_list.next;
-
-	/* loop through the entire page list, once the first requested page */
-	for (index = 0; index < begin_page_no; index++) {
-		ptr = ptr->next;
-	}
-
-	curr = list_entry(ptr, page_node, list);
-	/* add each page with remap_pfn_range one by one */
-	/* up to the last requested page */
-	for (index = 0; index < pages_to_map; index++) {
-		if (remap_pfn_range(vma, vma->vm_start + index * PAGE_SIZE,
-				    page_to_pfn(curr->page), PAGE_SIZE,
-				    vma->vm_page_prot)) {
-			pr_warn("Failed to map page at index %lu\n", index);
-			return -EAGAIN;
-		}
-
-		curr = list_entry(curr->list.next, page_node, list);
-	}
-
-	return 0;
-}
-
 struct file_operations asgn2_fops = { .owner = THIS_MODULE,
 				      .read = asgn2_read,
 				      .write = asgn2_write,
 				      .unlocked_ioctl = asgn2_ioctl,
 				      .open = asgn2_open,
-				      .mmap = asgn2_mmap,
-				      .release = asgn2_release,
-				      .llseek = asgn2_lseek };
+				      .release = asgn2_release };
 
 static void *my_seq_start(struct seq_file *s, loff_t *pos)
 {
@@ -493,106 +359,3 @@ static struct proc_ops asgn2_proc_ops = {
 	.proc_read = seq_read,
 	.proc_release = seq_release,
 };
-
-/**
- * Initialise the module and create the master device
- */
-int __init asgn2_init_module(void)
-{
-	int rv;
-
-	//Allocate a major number for the device
-	if (((rv = alloc_chrdev_region(&asgn2_device.dev, 0, 1, MYDEV_NAME)) <
-	     0)) {
-		pr_warn("%s: can't create chrdev_region\n", MYDEV_NAME);
-		return rv;
-	}
-	// Create device class
-	pr_info("created chrdev_region\n");
-	if (IS_ERR(asgn2_device.class = class_create(MYDEV_NAME))) {
-		pr_warn("%s: can't create class\n", MYDEV_NAME);
-		rv = (int)PTR_ERR(asgn2_device.class);
-		goto fail_class_create;
-	}
-
-	pr_info("set up class\n");
-
-	// Create device
-	if (IS_ERR(asgn2_device.device = device_create(asgn2_device.class, NULL,
-						       asgn2_device.dev, "%s",
-						       MYDEV_NAME))) {
-		pr_warn("%s: can't create device\n", MYDEV_NAME);
-		rv = (int)PTR_ERR(asgn2_device.device);
-		goto fail_device_create;
-	}
-
-	pr_info("set up device entry\n");
-
-	// Initialise the cdev and add it
-	cdev_init(&asgn2_device.cdev, &asgn2_fops);
-	if ((rv = cdev_add(&asgn2_device.cdev, asgn2_device.dev, 1)) < 0) {
-		pr_warn("%s: can't create udev device\n", MYDEV_NAME);
-		goto fail_cdev_add;
-	}
-
-	pr_info("set up udev entry\n");
-
-	// Create a memory cache for page nodes
-	if (IS_ERR(asgn2_device.cache =
-			   kmem_cache_create("cache", sizeof(page_node), 0,
-					     SLAB_HWCACHE_ALIGN, NULL))) {
-		pr_err("kmem_cache_create failed\n");
-		rv = (int)PTR_ERR(asgn2_device.cache);
-		goto fail_kmem_cache_create;
-	}
-	pr_info("successfully created cache");
-
-	// Create a proc entry
-	if (IS_ERR(entry = proc_create(MY_PROC_NAME, 0660, NULL,
-				       &asgn2_proc_ops))) {
-		pr_err("Failed to create proc entry\n");
-		rv = (int)PTR_ERR(entry);
-		goto fail_proc_create;
-	}
-	pr_info("Successfully created proc entry");
-
-	/* Initialise fields */
-	INIT_LIST_HEAD(&asgn2_device.mem_list);
-	asgn2_device.num_pages = 0;
-	atomic_set(&asgn2_device.nprocs, 0);
-	atomic_set(&asgn2_device.max_nprocs, 1);
-	return 0;
-
-	// Cleanup on error occuring
-fail_proc_create:
-	kmem_cache_destroy(asgn2_device.cache);
-fail_kmem_cache_create:
-	cdev_del(&asgn2_device.cdev);
-fail_cdev_add:
-	device_destroy(asgn2_device.class, asgn2_device.dev);
-fail_device_create:
-	class_destroy(asgn2_device.class);
-fail_class_create:
-	unregister_chrdev_region(asgn2_device.dev, 1);
-
-	return rv;
-}
-
-/**
- * Finalise the module
- */
-void __exit asgn2_exit_module(void)
-{
-	free_memory_pages();
-	kmem_cache_destroy(asgn2_device.cache);
-	remove_proc_entry(MY_PROC_NAME, NULL);
-	cdev_del(&asgn2_device.cdev);
-	device_destroy(asgn2_device.class, asgn2_device.dev);
-	class_destroy(asgn2_device.class);
-	unregister_chrdev_region(asgn2_device.dev, 1);
-
-	pr_info("Good bye from %s\n", MYDEV_NAME);
-}
-
-module_init(asgn2_init_module);
-module_exit(asgn2_exit_module);

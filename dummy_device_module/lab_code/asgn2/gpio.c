@@ -16,23 +16,41 @@
  * as published by the Free Software Foundation; either version
  * 2 of the License, or (at your option) any later version.
  */
-
-#include "linux/printk.h"
+#include "linux/list.h"
+#define BUF_SIZE 2000
+#define MYDEV_NAME "asgn2"
+#define MY_PROC_NAME "asgn2_proc"
+#define MYIOC_TYPE 'k'
+#include <linux/printk.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/proc_fs.h>
 #include <linux/gpio.h>
+#include <linux/mm.h>
+#include <linux/cdev.h>
+#include <linux/seq_file.h>
+#include <linux/highmem.h>
 #include <linux/interrupt.h>
 #include <linux/version.h>
 #include <linux/delay.h>
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
 #include <asm/switch_to.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h> // For kmalloc, kfree
+#include <linux/vmalloc.h> // For vmalloc, vfree
+#include <linux/gfp.h>
 #else
 #include <asm/system.h>
 #endif
 
+#include "ring_buffer.h"
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jake Norton");
 MODULE_DESCRIPTION("COSC440 asgn2");
+
+//including like this for now
+#include "device_operations.c"
 #define BCM2835_PERI_BASE 0x3f000000
 
 static u32 gpio_dummy_base;
@@ -141,12 +159,7 @@ static void write_to_gpio(char c)
 
 static u8 one_byte = 0;
 static bool first_half = true;
-#define BUF_SIZE 1000
-typedef struct {
-	char *read;
-	char *write;
-	char buf[BUF_SIZE];
-} ringbuffer_t;
+DECLARE_RINGBUFFER(ring_buffer);
 
 void printbits(u8 byte)
 {
@@ -156,6 +169,71 @@ void printbits(u8 byte)
 	}
 	pr_info("bits: %s", bits);
 }
+
+static void copy_to_mem_list(unsigned long t_arg)
+{
+	page_node *curr;
+	char new_char = ringbuffer_read(&ring_buffer);
+	void *virt_addr;
+
+	// Handle empty list of memory and allocate first page
+	if (list_empty(&asgn2_device.mem_list)) {
+		curr = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
+		if (!curr) {
+			pr_err("Failed to allocate cache memory");
+			return;
+		}
+		curr->page = alloc_page(GFP_KERNEL);
+		if (!curr->page) {
+			kmem_cache_free(asgn2_device.cache, curr);
+			pr_err("Failed to allocate memory");
+			return;
+		}
+		curr->data_size = 0; // Initialize data_size
+		list_add_tail(&curr->list, &asgn2_device.mem_list);
+		asgn2_device.num_pages++;
+	} else {
+		// Get the last page node
+		curr = list_last_entry(&asgn2_device.mem_list, page_node, list);
+	}
+
+	// Check if the current page is full
+	if (curr->data_size >= PAGE_SIZE) {
+		/* flush_dcache_page(curr->page); */
+		// Allocate a new page
+		page_node *new_node =
+			kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
+		if (!new_node) {
+			pr_err("Failed to allocate cache memory for new page");
+			return;
+		}
+		new_node->page = alloc_page(GFP_KERNEL);
+		if (!new_node->page) {
+			kmem_cache_free(asgn2_device.cache, new_node);
+			pr_err("Failed to allocate memory for new page");
+			return;
+		}
+		new_node->data_size = 0;
+		list_add_tail(&new_node->list, &asgn2_device.mem_list);
+		asgn2_device.num_pages++;
+		curr = new_node;
+	}
+
+	// Map the page to a virtual address
+	virt_addr = kmap(curr->page);
+	if (!virt_addr) {
+		pr_err("Failed to map page to virtual address");
+		return;
+	}
+
+	// Write the byte to the page
+	*((char *)virt_addr + curr->data_size) = new_char;
+	curr->data_size++;
+	kunmap(curr->page);
+	// Update the total data size of the device
+	asgn2_device.data_size++;
+}
+static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);
 
 irqreturn_t dummyport_interrupt(int irq, void *dev_id)
 {
@@ -171,6 +249,8 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id)
 		pr_info("Combined byte: 0x%02X ('%c')", one_byte,
 			(one_byte >= 32 && one_byte <= 126) ? one_byte : '.');
 		first_half = true;
+		ringbuffer_write(&ring_buffer, one_byte);
+		tasklet_schedule(&circular_tasklet);
 		one_byte = 0;
 	}
 
@@ -211,9 +291,81 @@ int __init gpio_dummy_init(void)
 		       ret);
 		goto fail1;
 	}
-	write_to_gpio(15);
+
+	//Allocate a major number for the device
+	if (((ret = alloc_chrdev_region(&asgn2_device.dev, 0, 1, MYDEV_NAME)) <
+	     0)) {
+		pr_warn("%s: can't create chrdev_region\n", MYDEV_NAME);
+		return ret;
+	}
+	// Create device class
+	pr_info("created chrdev_region\n");
+	if (IS_ERR(asgn2_device.class = class_create(MYDEV_NAME))) {
+		pr_warn("%s: can't create class\n", MYDEV_NAME);
+		ret = (int)PTR_ERR(asgn2_device.class);
+		goto fail_class_create;
+	}
+
+	pr_info("set up class\n");
+
+	// Create device
+	if (IS_ERR(asgn2_device.device = device_create(asgn2_device.class, NULL,
+						       asgn2_device.dev, "%s",
+						       MYDEV_NAME))) {
+		pr_warn("%s: can't create device\n", MYDEV_NAME);
+		ret = (int)PTR_ERR(asgn2_device.device);
+		goto fail_device_create;
+	}
+
+	pr_info("set up device entry\n");
+
+	// Initialise the cdev and add it
+	cdev_init(&asgn2_device.cdev, &asgn2_fops);
+	if ((ret = cdev_add(&asgn2_device.cdev, asgn2_device.dev, 1)) < 0) {
+		pr_warn("%s: can't create udev device\n", MYDEV_NAME);
+		goto fail_cdev_add;
+	}
+
+	pr_info("set up udev entry\n");
+
+	// Create a memory cache for page nodes
+	if (IS_ERR(asgn2_device.cache =
+			   kmem_cache_create("cache", sizeof(page_node), 0,
+					     SLAB_HWCACHE_ALIGN, NULL))) {
+		pr_err("kmem_cache_create failed\n");
+		ret = (int)PTR_ERR(asgn2_device.cache);
+		goto fail_kmem_cache_create;
+	}
+	pr_info("successfully created cache");
+
+	// Create a proc entry
+	if (IS_ERR(entry = proc_create(MY_PROC_NAME, 0660, NULL,
+				       &asgn2_proc_ops))) {
+		pr_err("Failed to create proc entry\n");
+		ret = (int)PTR_ERR(entry);
+		goto fail_proc_create;
+	}
+	pr_info("Successfully created proc entry");
+
+	/* Initialise fields */
+	INIT_LIST_HEAD(&asgn2_device.mem_list);
+	asgn2_device.num_pages = 0;
+	atomic_set(&asgn2_device.nprocs, 0);
+	atomic_set(&asgn2_device.max_nprocs, 1);
 	return 0;
 
+	// Cleanup on error occuring
+fail_proc_create:
+	kmem_cache_destroy(asgn2_device.cache);
+fail_kmem_cache_create:
+	cdev_del(&asgn2_device.cdev);
+fail_cdev_add:
+	device_destroy(asgn2_device.class, asgn2_device.dev);
+fail_device_create:
+	class_destroy(asgn2_device.class);
+fail_class_create:
+	unregister_chrdev_region(asgn2_device.dev, 1);
+	write_to_gpio(15);
 fail1:
 	gpio_free_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
 	iounmap((void *)gpio_dummy_base);
