@@ -16,7 +16,6 @@
  * as published by the Free Software Foundation; either version
  * 2 of the License, or (at your option) any later version.
  */
-#include "linux/list.h"
 #define BUF_SIZE 2000
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
@@ -25,6 +24,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
+#include <linux/list.h>
 #include <linux/gpio.h>
 #include <linux/mm.h>
 #include <linux/cdev.h>
@@ -174,6 +174,7 @@ static void copy_to_mem_list(unsigned long t_arg)
 {
 	page_node *curr;
 	char new_char = ringbuffer_read(&ring_buffer);
+	print_char(new_char);
 	void *virt_addr;
 
 	// Handle empty list of memory and allocate first page
@@ -229,10 +230,13 @@ static void copy_to_mem_list(unsigned long t_arg)
 	// Write the byte to the page
 	*((char *)virt_addr + curr->data_size) = new_char;
 	curr->data_size++;
+	print_int(curr->data_size);
 	kunmap(curr->page);
 	// Update the total data size of the device
 	asgn2_device.data_size++;
+	print_int(asgn2_device.data_size);
 }
+
 static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);
 
 irqreturn_t dummyport_interrupt(int irq, void *dev_id)
@@ -246,8 +250,8 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id)
 	} else {
 		one_byte |=
 			half; // Combine with the second half in the lower 4 bits
-		pr_info("Combined byte: 0x%02X ('%c')", one_byte,
-			(one_byte >= 32 && one_byte <= 126) ? one_byte : '.');
+		/* pr_info("Combined byte: 0x%02X ('%c')", one_byte, */
+		/* 	(one_byte >= 32 && one_byte <= 126) ? one_byte : '.'); */
 		first_half = true;
 		ringbuffer_write(&ring_buffer, one_byte);
 		tasklet_schedule(&circular_tasklet);
@@ -377,6 +381,13 @@ void __exit gpio_dummy_exit(void)
 	free_irq(dummy_irq, NULL);
 	gpio_free_array(gpio_dummy, ARRAY_SIZE(gpio_dummy));
 	iounmap((void *)gpio_dummy_base);
+	free_memory_pages();
+	kmem_cache_destroy(asgn2_device.cache);
+	remove_proc_entry(MY_PROC_NAME, NULL);
+	cdev_del(&asgn2_device.cdev);
+	device_destroy(asgn2_device.class, asgn2_device.dev);
+	class_destroy(asgn2_device.class);
+	unregister_chrdev_region(asgn2_device.dev, 1);
 }
 
 module_init(gpio_dummy_init);

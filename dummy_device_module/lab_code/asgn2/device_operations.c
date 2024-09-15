@@ -93,80 +93,67 @@ int asgn2_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-/**
- * This function reads contents of the virtual disk and writes to the user 
- */
 ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		   loff_t *f_pos)
 {
-	if (*f_pos >= asgn2_device.data_size) {
-		return 0;
-	}
-
 	size_t size_read = 0;
-	size_t begin_offset = (size_t)*f_pos % PAGE_SIZE;
-	int begin_page_no = *f_pos / PAGE_SIZE;
-	count = min(count, asgn2_device.data_size - (size_t)*f_pos);
-
-	int curr_page_no;
-	size_t size_to_be_read;
-
-	if (asgn2_device.mem_list.next == NULL) {
-		pr_warn("The asgn2_device.mem_list.next pointer is null");
-		return -EFAULT;
-	}
-	struct list_head *ptr = asgn2_device.mem_list.next;
+	unsigned long offset;
+	int result = 0;
 	page_node *curr;
+	char *kernel_buf;
 
-	for (curr_page_no = 0; curr_page_no < begin_page_no; curr_page_no++) {
-		ptr = ptr->next;
+	if (*f_pos >= asgn2_device.data_size)
+		return 0; // EOF
+
+	if (*f_pos + count > asgn2_device.data_size)
+		count = asgn2_device.data_size - *f_pos;
+
+	kernel_buf = kmalloc(count, GFP_KERNEL);
+	if (!kernel_buf) {
+		return -ENOMEM;
 	}
 
-	curr = list_entry(ptr, page_node, list);
-	unsigned long size_not_read;
+	list_for_each_entry(curr, &asgn2_device.mem_list, list) {
+		if (*f_pos < (curr->data_size + size_read)) {
+			offset = *f_pos - size_read;
 
-	while (size_read < count) {
-		if (!curr) {
-			return size_read;
-		}
-		if (!curr->page) {
-			return size_read;
-		}
-		size_to_be_read = min((count - size_read),
-				      PAGE_SIZE - (size_t)begin_offset);
+			while (offset < curr->data_size && size_read < count) {
+				char *page_data = kmap(curr->page);
+				if (!page_data) {
+					result = -ENOMEM;
+					goto out;
+				}
 
-		void *current_address = page_address(curr->page);
-		current_address += begin_offset;
-		size_not_read =
-			copy_to_user(buf, current_address, size_to_be_read);
+				kernel_buf[size_read] = page_data[offset];
 
-		if (size_not_read != 0) {
-			if (size_read > 0) {
-				pr_warn("size_not_read %lu exiting...",
-					size_not_read);
-				return size_not_read;
+				if (kernel_buf[size_read] == '\0') {
+					kunmap(curr->page);
+					goto out; // Found null byte, end of file
+				}
+
+				size_read++;
+				offset++;
+				(*f_pos)++;
+
+				kunmap(curr->page);
+
+				if (size_read >= count)
+					goto out;
 			}
-			return -EINVAL;
-		}
-		size_read += size_to_be_read;
-		*f_pos += size_to_be_read;
-		buf += size_to_be_read;
-		begin_offset = 0;
-		if (size_read < count) {
-			if (list_is_last(&curr->list, &asgn2_device.mem_list)) {
-				pr_info("size_not_read %lu exiting...",
-					size_not_read);
-				pr_info("list is last size_read %zu exiting...",
-					size_read);
-				return size_read;
-			}
-			curr = list_entry(curr->list.next, page_node, list);
+		} else {
+			size_read += curr->data_size;
 		}
 	}
 
-	pr_info("Finished read successfully after reading %d", size_read);
+out:
+	if (size_read > 0) {
+		if (copy_to_user(buf, kernel_buf, size_read) != 0) {
+			result = -EFAULT;
+		}
+	}
 
-	return size_read;
+	kfree(kernel_buf);
+	return result < 0 ? result : size_read;
 }
 
 /**
