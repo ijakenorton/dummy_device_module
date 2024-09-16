@@ -1,4 +1,7 @@
 
+#include "linux/atomic/atomic-instrumented.h"
+#include "linux/highmem-internal.h"
+#include "ring_buffer.h"
 #define BUF_SIZE 2000
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
@@ -15,6 +18,11 @@
 #include <linux/highmem.h>
 #include <linux/version.h>
 #include <linux/delay.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
 #include <asm/switch_to.h>
 #else
@@ -37,11 +45,15 @@ typedef struct gpio_dev_t {
 	size_t read_offset;
 	atomic_t nprocs; /* number of processes accessing this device */
 	atomic_t max_nprocs; /* max number of processes accessing this device */
+	atomic_t data_ready;
+	wait_queue_head_t data_queue;
+	struct mutex device_mutex;
 	struct kmem_cache *cache; /* cache memory */
 	struct class *class; /* the udev class */
 	struct device *device; /* the udev device node */
 } gpio_dev;
 
+#define print_fpos(val) pr_info(#val " = %lld", *val)
 int asgn2_major = 0; /* major number of module */
 int asgn2_minor = 0; /* minor number of module */
 int asgn2_dev_count = 1; /* number of devices */
@@ -67,97 +79,172 @@ void free_memory_pages(void)
 }
 int asgn2_open(struct inode *inode, struct file *filp)
 {
-	/* Increment process count, if exceeds max_nprocs, return -EBUSY */
-	int nprocs = atomic_read(&asgn2_device.nprocs) + 1;
-	if (nprocs > atomic_read(&asgn2_device.max_nprocs)) {
-		return -EBUSY;
+	int ret;
+
+	// Wait until the device is available
+	ret = mutex_lock_interruptible(&asgn2_device.device_mutex);
+	if (ret)
+		return ret; // Return -ERESTARTSYS if interrupted
+
+	// Check if it's opened for reading (read-only device)
+	if ((filp->f_flags & O_ACCMODE) != O_RDONLY) {
+		mutex_unlock(&asgn2_device.device_mutex);
+		return -EACCES; // Return "Permission denied" for non-read-only access
 	}
 
-	atomic_set(&asgn2_device.nprocs, nprocs);
-	/* if opened in write-only mode, free all memory pages */
+	// Increment process count (should always be 1 at this point)
+	atomic_inc(&asgn2_device.nprocs);
 
 	return 0; /* success */
 }
 
-/**
- * This function releases the virtual disk, but nothing needs to be done
- * in this case. 
- */
 int asgn2_release(struct inode *inode, struct file *filp)
 {
-	int nprocs = atomic_read(&asgn2_device.nprocs);
-	if (nprocs > 0) {
-		atomic_set(&asgn2_device.nprocs, nprocs - 1);
-	}
+	// Decrement process count
+	atomic_dec(&asgn2_device.nprocs);
+
+	// Release the mutex to allow other processes to open the device
+	mutex_unlock(&asgn2_device.device_mutex);
+
 	return 0;
 }
 
 ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		   loff_t *f_pos)
 {
-	size_t size_read = 0;
-	int result = 0;
-	page_node *curr;
-	page_node *temp;
+	size_t size_to_read = 0;
+	size_t available_bytes = 0;
+	int rv = 0;
+	page_node *curr, *temp;
 	char *kernel_buf;
+	size_t size_written = 0;
 
-	if (asgn2_device.read_offset + count > asgn2_device.data_size)
-		count = asgn2_device.data_size - asgn2_device.read_offset;
+	/* 	// Wait for data if the buffer is empty */
+	/* 	while (asgn2_device.data_size == 0) { */
+	/* 		if (filp->f_flags & O_NONBLOCK) */
+	/* 			return -EAGAIN; */
 
-	kernel_buf = kmalloc(count, GFP_KERNEL);
-	if (!kernel_buf) {
-		return -ENOMEM;
+	/* 		if (wait_event_interruptible(asgn2_device.data_queue, */
+	/* 					     asgn2_device.data_size > 0)) */
+	/* 			return -ERESTARTSYS; */
+	/* 	} */
+	/* if (asgn2_device.read_offset + *f_pos >= asgn2_device.data_size) { */
+	/* 	pr_warn("asgn2_device.read_offset + *f_pos >= asgn2_device.data_size"); */
+	/* 	return 0; */
+	/* } */
+	//find first EOF
+	size_t num_loops = 0;
+	list_for_each_entry(curr, &asgn2_device.mem_list, list) {
+		char *page_data = kmap_local_page(curr->page);
+		if (!page_data) {
+			pr_warn("No page data");
+			return -ENOMEM;
+		}
+		for (size_t i = curr->read_offset; i < PAGE_SIZE; i++) {
+			if (available_bytes == asgn2_device.data_size) {
+				pr_warn("Hit data size condition");
+				print_zu(available_bytes);
+				print_lu(curr->read_offset);
+				kunmap_local(page_data);
+				num_loops++;
+				goto end_eof_loop;
+			}
+			if (page_data[i] == '\xFF') {
+				pr_warn("found eof");
+				print_zu(available_bytes);
+				print_lu(curr->read_offset);
+				pr_warn("end eof");
+				kunmap_local(page_data);
+
+				num_loops++;
+				goto end_eof_loop;
+			}
+
+			available_bytes++;
+		}
+		num_loops++;
 	}
+
+end_eof_loop:
+	if (available_bytes == 0) {
+		curr->read_offset++;
+		asgn2_device.read_offset++;
+		/* curr->read_offset++; */
+		/* asgn2_device.read_offset++; */
+		pr_warn("Available bytes is 0");
+		print_zu(asgn2_device.read_offset);
+		print_lu(curr->read_offset);
+		pr_warn("end available is  0");
+		return 0;
+	}
+	size_to_read = min(available_bytes, count);
+	kernel_buf = kmalloc(size_to_read, GFP_KERNEL);
 
 	list_for_each_entry_safe(curr, temp, &asgn2_device.mem_list, list) {
-		char *page_data = (char *)kmap(curr->page);
+		char *page_data = kmap_local_page(curr->page);
 		if (!page_data) {
-			result = -ENOMEM;
-			goto out;
+			pr_warn("No page data");
+			return -ENOMEM;
 		}
-		while (size_read < count) {
-			if (curr->read_offset >= PAGE_SIZE) {
-				kunmap(curr->page);
+		for (size_t i = curr->read_offset; i < PAGE_SIZE; i++) {
+			//add to kernel buffer for writing
+			if (size_written < size_to_read) {
+				kernel_buf[size_written++] = page_data[i];
+			} else if (i >= available_bytes) {
+				pr_warn("i >= available_bytes");
+				print_lu(curr->read_offset);
+				kunmap_local(page_data);
+				goto end_write_loop;
+			}
+			curr->read_offset++;
+		}
 
-				if (curr->page) {
-					__free_page(curr->page);
-					curr->page = NULL;
-				}
+		kunmap_local(page_data);
+	}
 
-				list_del(&curr->list);
-				kmem_cache_free(asgn2_device.cache, curr);
+end_write_loop:
+	if (size_written != 0) {
+		size_t size_not_read =
+			copy_to_user(buf, kernel_buf, size_written);
+		if (size_not_read != 0) {
+			if (size_written > 0) {
+				rv = size_written - size_not_read;
 				goto end;
 			}
-			kernel_buf[size_read] = page_data[curr->read_offset];
 
-			if (kernel_buf[size_read] == '\0') {
-				kunmap(curr->page);
-				goto out; // Found null byte, end of file
-			}
-
-			size_read++;
-			asgn2_device.read_offset++;
-			curr->read_offset++;
-
-			if (size_read >= count)
-				goto out;
+			rv = -EINVAL;
 		}
-		kunmap(curr->page);
+		rv = size_written;
+	}
+
 end:
-		continue;
-	}
 
-out:
-	if (size_read > 0) {
-		if (copy_to_user(buf, kernel_buf, size_read) != 0) {
-			result = -EFAULT;
-		}
-	}
+	//cleanup pages that have been written
+	/* list_for_each_entry_safe(curr, temp, &asgn2_device.mem_list, list) { */
+	/* 	if (curr->page) { */
+	/* 		__free_page(curr->page); */
+	/* 		curr->page = NULL; */
+	/* 	} */
+
+	/* 	list_del(&curr->list); */
+	/* 	kmem_cache_free(asgn2_device.cache, curr); */
+
+	/* 	asgn2_device.num_pages--; */
+
+	/* 	num_loops--; */
+	/* 	if (num_loops == 1) { */
+	/* 		asgn2_device.data_size -= */
+	/* 			(size_written - curr->read_offset); */
+	/* 		break; */
+	/* 	} */
+	/* } */
+
+	asgn2_device.data_size -= (size_written);
+	asgn2_device.read_offset += available_bytes;
+	*f_pos += available_bytes;
 
 	kfree(kernel_buf);
-	asgn2_device.data_size -= size_read;
-	asgn2_device.read_offset -= size_read;
-	return result < 0 ? result : size_read;
+	return rv;
 }
 
 /**
@@ -227,9 +314,11 @@ static void my_seq_stop(struct seq_file *s, void *v)
 
 int my_seq_show(struct seq_file *s, void *v)
 {
-	seq_printf(s, "Pages: %i\nMemory: %i bytes\nDevices: %i\n",
-		   asgn2_device.num_pages, asgn2_device.data_size,
-		   atomic_read(&asgn2_device.nprocs));
+	seq_printf(
+		s,
+		"Pages: %i\nMemory: %i bytes\nRead offset %zu\nDevices: %i\n",
+		asgn2_device.num_pages, asgn2_device.data_size,
+		asgn2_device.read_offset, atomic_read(&asgn2_device.nprocs));
 	return 0;
 }
 

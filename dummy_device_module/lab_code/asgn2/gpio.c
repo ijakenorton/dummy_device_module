@@ -16,6 +16,7 @@
  * as published by the Free Software Foundation; either version
  * 2 of the License, or (at your option) any later version.
  */
+#include "linux/mutex.h"
 #define BUF_SIZE 2000
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
@@ -169,36 +170,40 @@ void printbits(u8 byte)
 	}
 	pr_info("bits: %s", bits);
 }
-void add_page_node(page_node *new_node)
+page_node *add_page_node(void)
 {
-	new_node = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
+	page_node *new_node = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
 	if (!new_node) {
 		pr_err("Failed to allocate cache memory");
-		return;
+		return NULL;
 	}
 	new_node->page = alloc_page(GFP_KERNEL);
 	if (!new_node->page) {
 		kmem_cache_free(asgn2_device.cache, new_node);
 		pr_err("Failed to allocate memory");
-		return;
+		return NULL;
 	}
-	new_node->write_offset = 0; // Initialize data_size
-	new_node->read_offset = 0; // Initialize data_size
+	new_node->write_offset = 0;
+	new_node->read_offset = 0;
 	list_add_tail(&new_node->list, &asgn2_device.mem_list);
 	asgn2_device.num_pages++;
+	return new_node;
 }
 
 static void copy_to_mem_list(unsigned long t_arg)
 {
-	page_node *curr = { 0 };
-	page_node *new_node = { 0 };
+	page_node *curr = NULL;
 	char new_char = ringbuffer_read(&ring_buffer);
-	print_char(new_char);
+	/* print_char(new_char); */
 	void *virt_addr;
 
 	// Handle empty list of memory and allocate first page
 	if (list_empty(&asgn2_device.mem_list)) {
-		add_page_node(curr);
+		curr = add_page_node();
+		if (!curr) {
+			pr_err("Failed to add initial page node");
+			return;
+		}
 	} else {
 		// Get the last page node
 		curr = list_last_entry(&asgn2_device.mem_list, page_node, list);
@@ -208,9 +213,11 @@ static void copy_to_mem_list(unsigned long t_arg)
 	if (curr->write_offset >= PAGE_SIZE) {
 		/* flush_dcache_page(curr->page); */
 		// Allocate a new page
-		add_page_node(new_node);
-
-		curr = new_node;
+		curr = add_page_node();
+		if (!curr) {
+			pr_err("Failed to add new page node");
+			return;
+		}
 	}
 
 	// Map the page to a virtual address
@@ -219,17 +226,24 @@ static void copy_to_mem_list(unsigned long t_arg)
 		pr_err("Failed to map page to virtual address");
 		return;
 	}
+	if (new_char == '\0') {
+		pr_warn("EOF offset");
+		print_lu((curr->write_offset + 1));
+		new_char = '\xFF';
+		/* atomic_set(&asgn2_device.data_ready, 1); */
+		/* wake_up_interruptible(&asgn2_device.data_queue); */
+	}
 
 	// Write the byte to the page
 	*((char *)virt_addr + curr->write_offset) = new_char;
 	curr->write_offset++;
-	print_lu(curr->write_offset);
+
 	kunmap(curr->page);
+
 	// Update the total data size of the device
 	asgn2_device.data_size++;
-	print_int(asgn2_device.data_size);
+	/* print_int(asgn2_device.data_size); */
 }
-
 static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);
 
 irqreturn_t dummyport_interrupt(int irq, void *dev_id)
@@ -351,6 +365,9 @@ int __init gpio_dummy_init(void)
 	asgn2_device.num_pages = 0;
 	atomic_set(&asgn2_device.nprocs, 0);
 	atomic_set(&asgn2_device.max_nprocs, 1);
+	mutex_init(&asgn2_device.device_mutex);
+	init_waitqueue_head(&asgn2_device.data_queue);
+	atomic_set(&asgn2_device.data_ready, 0);
 	return 0;
 
 	// Cleanup on error occuring
@@ -383,6 +400,7 @@ void __exit gpio_dummy_exit(void)
 	device_destroy(asgn2_device.class, asgn2_device.dev);
 	class_destroy(asgn2_device.class);
 	unregister_chrdev_region(asgn2_device.dev, 1);
+	mutex_destroy(&asgn2_device.device_mutex);
 }
 
 module_init(gpio_dummy_init);

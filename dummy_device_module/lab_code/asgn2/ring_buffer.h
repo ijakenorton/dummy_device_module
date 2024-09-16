@@ -13,6 +13,7 @@
 #define print_char(val) pr_info(#val " = %c\n", val)
 #define print_int(val) pr_info(#val " = %d\n", val)
 #define print_lu(val) pr_info(#val " = %lu\n", val)
+#define print_zu(val) pr_info(#val " = %zu\n", val)
 
 typedef struct {
 	char *read;
