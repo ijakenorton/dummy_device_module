@@ -169,54 +169,47 @@ void printbits(u8 byte)
 	}
 	pr_info("bits: %s", bits);
 }
+void add_page_node(page_node *new_node)
+{
+	new_node = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
+	if (!new_node) {
+		pr_err("Failed to allocate cache memory");
+		return;
+	}
+	new_node->page = alloc_page(GFP_KERNEL);
+	if (!new_node->page) {
+		kmem_cache_free(asgn2_device.cache, new_node);
+		pr_err("Failed to allocate memory");
+		return;
+	}
+	new_node->write_offset = 0; // Initialize data_size
+	new_node->read_offset = 0; // Initialize data_size
+	list_add_tail(&new_node->list, &asgn2_device.mem_list);
+	asgn2_device.num_pages++;
+}
 
 static void copy_to_mem_list(unsigned long t_arg)
 {
-	page_node *curr;
+	page_node *curr = { 0 };
+	page_node *new_node = { 0 };
 	char new_char = ringbuffer_read(&ring_buffer);
 	print_char(new_char);
 	void *virt_addr;
 
 	// Handle empty list of memory and allocate first page
 	if (list_empty(&asgn2_device.mem_list)) {
-		curr = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
-		if (!curr) {
-			pr_err("Failed to allocate cache memory");
-			return;
-		}
-		curr->page = alloc_page(GFP_KERNEL);
-		if (!curr->page) {
-			kmem_cache_free(asgn2_device.cache, curr);
-			pr_err("Failed to allocate memory");
-			return;
-		}
-		curr->data_size = 0; // Initialize data_size
-		list_add_tail(&curr->list, &asgn2_device.mem_list);
-		asgn2_device.num_pages++;
+		add_page_node(curr);
 	} else {
 		// Get the last page node
 		curr = list_last_entry(&asgn2_device.mem_list, page_node, list);
 	}
 
 	// Check if the current page is full
-	if (curr->data_size >= PAGE_SIZE) {
+	if (curr->write_offset >= PAGE_SIZE) {
 		/* flush_dcache_page(curr->page); */
 		// Allocate a new page
-		page_node *new_node =
-			kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
-		if (!new_node) {
-			pr_err("Failed to allocate cache memory for new page");
-			return;
-		}
-		new_node->page = alloc_page(GFP_KERNEL);
-		if (!new_node->page) {
-			kmem_cache_free(asgn2_device.cache, new_node);
-			pr_err("Failed to allocate memory for new page");
-			return;
-		}
-		new_node->data_size = 0;
-		list_add_tail(&new_node->list, &asgn2_device.mem_list);
-		asgn2_device.num_pages++;
+		add_page_node(new_node);
+
 		curr = new_node;
 	}
 
@@ -228,9 +221,9 @@ static void copy_to_mem_list(unsigned long t_arg)
 	}
 
 	// Write the byte to the page
-	*((char *)virt_addr + curr->data_size) = new_char;
-	curr->data_size++;
-	print_int(curr->data_size);
+	*((char *)virt_addr + curr->write_offset) = new_char;
+	curr->write_offset++;
+	print_lu(curr->write_offset);
 	kunmap(curr->page);
 	// Update the total data size of the device
 	asgn2_device.data_size++;
@@ -254,6 +247,8 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id)
 		/* 	(one_byte >= 32 && one_byte <= 126) ? one_byte : '.'); */
 		first_half = true;
 		ringbuffer_write(&ring_buffer, one_byte);
+		//might be good to initialise this to NULL
+		/* circular_tasklet.data = (unsigned long)NULL; */
 		tasklet_schedule(&circular_tasklet);
 		one_byte = 0;
 	}

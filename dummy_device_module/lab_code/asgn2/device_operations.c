@@ -12,6 +12,7 @@
 #include <linux/cdev.h>
 #include <linux/seq_file.h>
 #include <linux/interrupt.h>
+#include <linux/highmem.h>
 #include <linux/version.h>
 #include <linux/delay.h>
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
@@ -23,7 +24,8 @@
 typedef struct page_node_rec {
 	struct list_head list;
 	struct page *page;
-	int data_size;
+	unsigned long write_offset;
+	unsigned long read_offset;
 } page_node;
 
 typedef struct gpio_dev_t {
@@ -32,6 +34,7 @@ typedef struct gpio_dev_t {
 	struct list_head mem_list;
 	int num_pages; /* number of memory pages this module currently holds */
 	size_t data_size; /* total data size in this module */
+	size_t read_offset;
 	atomic_t nprocs; /* number of processes accessing this device */
 	atomic_t max_nprocs; /* max number of processes accessing this device */
 	struct kmem_cache *cache; /* cache memory */
@@ -72,10 +75,6 @@ int asgn2_open(struct inode *inode, struct file *filp)
 
 	atomic_set(&asgn2_device.nprocs, nprocs);
 	/* if opened in write-only mode, free all memory pages */
-	if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
-		pr_info("Device opened in write-only mode\n");
-		free_memory_pages();
-	}
 
 	return 0; /* success */
 }
@@ -97,52 +96,55 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		   loff_t *f_pos)
 {
 	size_t size_read = 0;
-	unsigned long offset;
 	int result = 0;
 	page_node *curr;
+	page_node *temp;
 	char *kernel_buf;
 
-	if (*f_pos >= asgn2_device.data_size)
-		return 0; // EOF
-
-	if (*f_pos + count > asgn2_device.data_size)
-		count = asgn2_device.data_size - *f_pos;
+	if (asgn2_device.read_offset + count > asgn2_device.data_size)
+		count = asgn2_device.data_size - asgn2_device.read_offset;
 
 	kernel_buf = kmalloc(count, GFP_KERNEL);
 	if (!kernel_buf) {
 		return -ENOMEM;
 	}
 
-	list_for_each_entry(curr, &asgn2_device.mem_list, list) {
-		if (*f_pos < (curr->data_size + size_read)) {
-			offset = *f_pos - size_read;
-
-			while (offset < curr->data_size && size_read < count) {
-				char *page_data = kmap(curr->page);
-				if (!page_data) {
-					result = -ENOMEM;
-					goto out;
-				}
-
-				kernel_buf[size_read] = page_data[offset];
-
-				if (kernel_buf[size_read] == '\0') {
-					kunmap(curr->page);
-					goto out; // Found null byte, end of file
-				}
-
-				size_read++;
-				offset++;
-				(*f_pos)++;
-
+	list_for_each_entry_safe(curr, temp, &asgn2_device.mem_list, list) {
+		char *page_data = (char *)kmap(curr->page);
+		if (!page_data) {
+			result = -ENOMEM;
+			goto out;
+		}
+		while (size_read < count) {
+			if (curr->read_offset >= PAGE_SIZE) {
 				kunmap(curr->page);
 
-				if (size_read >= count)
-					goto out;
+				if (curr->page) {
+					__free_page(curr->page);
+					curr->page = NULL;
+				}
+
+				list_del(&curr->list);
+				kmem_cache_free(asgn2_device.cache, curr);
+				goto end;
 			}
-		} else {
-			size_read += curr->data_size;
+			kernel_buf[size_read] = page_data[curr->read_offset];
+
+			if (kernel_buf[size_read] == '\0') {
+				kunmap(curr->page);
+				goto out; // Found null byte, end of file
+			}
+
+			size_read++;
+			asgn2_device.read_offset++;
+			curr->read_offset++;
+
+			if (size_read >= count)
+				goto out;
 		}
+		kunmap(curr->page);
+end:
+		continue;
 	}
 
 out:
@@ -153,6 +155,8 @@ out:
 	}
 
 	kfree(kernel_buf);
+	asgn2_device.data_size -= size_read;
+	asgn2_device.read_offset -= size_read;
 	return result < 0 ? result : size_read;
 }
 
@@ -163,108 +167,7 @@ out:
 ssize_t asgn2_write(struct file *filp, const char __user *buf, size_t count,
 		    loff_t *f_pos)
 {
-	if (count <= 0) {
-		return 0;
-	}
-	/* Shouldn't be possible*/
-	if (*f_pos > asgn2_device.data_size) {
-		pr_warn("Starting f_pos %lld is more than data_size, stopping write..",
-			*f_pos);
-		return -EINVAL;
-	}
-	size_t orig_f_pos = *f_pos;
-	size_t size_written = 0;
-	size_t begin_offset = *f_pos % PAGE_SIZE;
-	int begin_page_no = *f_pos / PAGE_SIZE;
-	int curr_page_no;
-	size_t size_to_be_written;
-
-	size_t size_not_written;
-	page_node *curr;
-
-	//Traverse the list until the first page reached, and add nodes if necessary
-
-	if (list_empty(&asgn2_device.mem_list)) {
-		curr = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
-		if (curr == NULL) {
-			pr_err("Failed to allocate cache memory");
-			return -ENOMEM;
-		}
-
-		curr->page = alloc_page(GFP_KERNEL);
-		if (!curr->page) {
-			kmem_cache_free(asgn2_device.cache, curr);
-			pr_err("Failed to allocate memory");
-			return -ENOMEM;
-		}
-		list_add_tail(&curr->list, &asgn2_device.mem_list);
-		asgn2_device.num_pages++;
-	} else {
-		// find the starting page
-		curr = list_first_entry(&asgn2_device.mem_list, page_node,
-					list);
-		for (curr_page_no = 0; curr_page_no < begin_page_no;
-		     curr_page_no++) {
-			if (list_is_last(&curr->list, &asgn2_device.mem_list)) {
-				break;
-			}
-			curr = list_entry(curr->list.next, page_node, list);
-		}
-	}
-	/* Then write the data page by page*/
-
-	while (size_written < count) {
-		// There is still size to be written
-		// We are not at the start of the device
-		// We need to start writing at the start of next page
-		if (*f_pos != 0 && begin_offset == 0) {
-			if (list_is_last(&curr->list, &asgn2_device.mem_list)) {
-				curr = kmem_cache_alloc(asgn2_device.cache,
-							GFP_KERNEL);
-
-				if (!curr) {
-					pr_err("Failed to allocate cache memory");
-					return size_written > 0 ? size_written :
-								  -ENOMEM;
-				}
-				curr->page = alloc_page(GFP_KERNEL);
-
-				if (!curr->page) {
-					kmem_cache_free(asgn2_device.cache,
-							curr);
-					pr_err("Failed to allocate memory");
-					return size_written > 0 ? size_written :
-								  -ENOMEM;
-				}
-				list_add_tail(&curr->list,
-					      &asgn2_device.mem_list);
-				asgn2_device.num_pages++;
-			} else {
-				curr = list_entry(curr->list.next, page_node,
-						  list);
-			}
-		}
-		size_to_be_written =
-			min((count - size_written), PAGE_SIZE - begin_offset);
-		size_not_written =
-			copy_from_user(page_address(curr->page) + begin_offset,
-				       buf, size_to_be_written);
-		if (size_not_written != 0) {
-			pr_warn("size_not_written %zu exiting...",
-				size_not_written);
-			return size_written > 0 ?
-				       size_written - size_not_written :
-				       -EFAULT;
-		}
-		size_written += size_to_be_written;
-		*f_pos += size_to_be_written;
-		buf += size_to_be_written;
-		begin_offset = 0;
-	}
-
-	asgn2_device.data_size =
-		max(asgn2_device.data_size, orig_f_pos + size_written);
-	return size_written;
+	return -1;
 }
 
 #define SET_NPROC_OP 1
