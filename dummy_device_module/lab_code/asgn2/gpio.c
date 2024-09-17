@@ -237,7 +237,6 @@ static void copy_to_mem_list(unsigned long t_arg)
 		/* atomic_set(&asgn2_device.data_ready, 1); */
 		/* wake_up_interruptible(&asgn2_device.data_queue); */
 	}
-
 	d_list_write(&asgn2_device.dlist, new_char);
 }
 static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);

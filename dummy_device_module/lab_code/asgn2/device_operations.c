@@ -106,8 +106,10 @@ void free_memory_pages(void)
 {
 	page_node *curr;
 	page_node *tmp;
+
 	list_for_each_entry_safe(curr, tmp, &asgn2_device.dlist.head, list) {
 		if (curr->page) {
+			kunmap_local(curr->base_address);
 			__free_page(curr->page);
 			curr->page = NULL;
 		}
@@ -126,7 +128,13 @@ void d_list_write(d_list_t *dlist, char value)
 {
 	page_node *new_node;
 	if (list_empty(&dlist->head)) {
+		pr_warn("list is empty");
 		new_node = allocate_node();
+		list_add_tail(&new_node->list, &dlist->head);
+
+		if (!new_node) {
+			pr_err("Failed to allocate node");
+		}
 		dlist->write = new_node;
 		dlist->read = new_node;
 		dlist->count = 0;
@@ -134,6 +142,7 @@ void d_list_write(d_list_t *dlist, char value)
 
 	//handle case where circular is full, add new node between next and previous node
 	if (dlist->count == (list_count_nodes(&dlist->head) * PAGE_SIZE)) {
+		pr_warn("list is full");
 		new_node = allocate_node();
 		//expand list
 		__list_add(&new_node->list, dlist->write->list.prev,
@@ -143,6 +152,7 @@ void d_list_write(d_list_t *dlist, char value)
 	// current page is full, moving to next element and resetting its write pointer
 	if (dlist->write->write_mapped ==
 	    dlist->write->base_address + PAGE_SIZE) {
+		pr_warn("page is full");
 		//move to next page node
 		dlist->write = list_next_entry_circular(dlist->write,
 							&dlist->head, list);
@@ -153,7 +163,9 @@ void d_list_write(d_list_t *dlist, char value)
 		//set write pointer to base_address of the page
 		dlist->write->write_mapped = dlist->write->base_address;
 	}
+	pr_warn("writing %c", value);
 	*dlist->write->write_mapped++ = value;
+	/* print_zu(dlist->count); */
 	dlist->count++;
 }
 
@@ -195,7 +207,7 @@ int d_list_read(d_list_t *dlist, char *value)
 {
 	//shouldnt happen, this should be handled before this point
 	if (dlist->count == 0) {
-		pr_info("Memory is empty, cannot read\n");
+		pr_info("Count is zero, cannot read\n");
 		return -1;
 	}
 
@@ -262,24 +274,21 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	/* 					     asgn2_device.data_size > 0)) */
 	/* 			return -ERESTARTSYS; */
 	/* 	} */
-	/* if (asgn2_device.read_offset + *f_pos >= asgn2_device.data_size) { */
-	/* 	pr_warn("asgn2_device.read_offset + *f_pos >= asgn2_device.data_size"); */
+	//
+	//To be fixed with proper waiting later
+	/* if (atomic_read(&asgn2_device.file_count) == 0) { */
+	/* 	pr_info("There is not at least one file\n"); */
 	/* 	return 0; */
+	/* } else { */
+	/* 	pr_info("There is a file"); */
 	/* } */
 	//find first EOF
-	//To be fixed with proper waiting later
-	if (atomic_read(&asgn2_device.file_count) == 0) {
-		pr_info("There is not at least one file\n");
-		return -1;
-	}
-	remaining_file_size = d_list_find(&asgn2_device.dlist, '\xFF');
+	//find is not working properly!
+	remaining_file_size = d_list_find(&asgn2_device.dlist, '\xFF') - 1;
+	print_zu(remaining_file_size);
 
 	if (remaining_file_size == 0) {
-		/* curr->read_mapped++; */
-		/* asgn2_device.read_offset++; */
-		/* curr->read_offset++; */
-		/* asgn2_device.read_offset++; */
-		d_list_read(&asgn2_device.dlist, &value);
+		/* d_list_read(&asgn2_device.dlist, &value); */
 		pr_warn("Remaining file size is 0");
 		/* print_zu(asgn2_device.read_offset); */
 		/* print_lu(curr->read_mapped); */
@@ -287,11 +296,26 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		return 0;
 	}
 	size_to_read = min(remaining_file_size, count);
+	if (size_to_read > 500) {
+		pr_warn("size to read is wrong");
+		print_zu(size_to_read);
+		return -1;
+	}
+
 	kernel_buf = kmalloc(size_to_read, GFP_KERNEL);
 
-	while (d_list_read(&asgn2_device.dlist, &value) != -1) {
-		*kernel_buf++ = value;
+	while (d_list_read(&asgn2_device.dlist, &value) != -1 &&
+	       size_written < size_to_read) {
+		/* print_char(value); */
+		if (value == '\xFF') {
+			pr_warn("got to the end of file");
+			atomic_dec(&asgn2_device.file_count);
+			break;
+		}
+		*(kernel_buf + size_written) = value;
+		size_written++;
 	}
+	pr_info("%s", kernel_buf);
 
 end_write_loop:
 	if (size_written != 0) {
@@ -522,9 +546,10 @@ int my_seq_show(struct seq_file *s, void *v)
 {
 	seq_printf(
 		s,
-		"Pages: %i\nMemory: %i bytes\nRead offset %zu\nDevices: %i\n",
+		"Pages: %d\nMemory: %zu bytes\nCount: %zu\nRead offset %d\nDevices: %d\n",
 		asgn2_device.num_pages, asgn2_device.data_size,
-		asgn2_device.read_offset, atomic_read(&asgn2_device.nprocs));
+		asgn2_device.dlist.count, atomic_read(&asgn2_device.file_count),
+		atomic_read(&asgn2_device.nprocs));
 	return 0;
 }
 
