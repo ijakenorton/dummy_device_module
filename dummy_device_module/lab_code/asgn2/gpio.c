@@ -171,59 +171,74 @@ void printbits(u8 byte)
 	pr_info("bits: %s", bits);
 }
 
+/* static void copy_to_mem_list(unsigned long t_arg) */
+/* { */
+/* 	page_node *curr = NULL; */
+/* 	char new_char = ringbuffer_read(&ring_buffer); */
+/* 	/1* print_char(new_char); *1/ */
+/* 	void *virt_addr; */
+
+/* 	// Handle empty list of memory and allocate first page */
+/* 	if (list_empty(&asgn2_device.mem_list)) { */
+/* 		curr = add_page_node(); */
+/* 		if (!curr) { */
+/* 			pr_err("Failed to add initial page node"); */
+/* 			return; */
+/* 		} */
+/* 	} else { */
+/* 		// Get the last page node */
+/* 		curr = list_last_entry(&asgn2_device.mem_list, page_node, list); */
+/* 	} */
+
+/* 	// Check if the current page is full */
+/* 	if (curr->write >= PAGE_SIZE) { */
+/* 		// Allocate a nenlctl -f */
+/* 		// page */
+/* 		curr = add_page_node(); */
+/* 		if (!curr) { */
+/* 			pr_err("Failed to add new page node"); */
+/* 			return; */
+/* 		} */
+/* 	} */
+
+/* 	// Map the page to a virtual address */
+/* 	virt_addr = kmap(curr->page); */
+/* 	if (!virt_addr) { */
+/* 		pr_err("Failed to map page to virtual address"); */
+/* 		return; */
+/* 	} */
+/* 	if (new_char == '\0') { */
+/* 		pr_warn("EOF offset"); */
+/* 		print_lu((curr->write + 1)); */
+/* 		new_char = '\xFF'; */
+/* 		/1* atomic_set(&asgn2_device.data_ready, 1); *1/ */
+/* 		/1* wake_up_interruptible(&asgn2_device.data_queue); *1/ */
+/* 	} */
+
+/* 	// Write the byte to the page */
+/* 	*((char *)virt_addr + curr->write) = new_char; */
+/* 	curr->write++; */
+
+/* 	kunmap(curr->page); */
+
+/* 	// Update the total data size of the device */
+/* 	asgn2_device.data_size++; */
+/* 	/1* print_int(asgn2_device.data_size); *1/ */
+/* } */
+
 static void copy_to_mem_list(unsigned long t_arg)
 {
-	page_node *curr = NULL;
 	char new_char = ringbuffer_read(&ring_buffer);
-	/* print_char(new_char); */
-	void *virt_addr;
 
-	// Handle empty list of memory and allocate first page
-	if (list_empty(&asgn2_device.mem_list)) {
-		curr = add_page_node();
-		if (!curr) {
-			pr_err("Failed to add initial page node");
-			return;
-		}
-	} else {
-		// Get the last page node
-		curr = list_last_entry(&asgn2_device.mem_list, page_node, list);
-	}
-
-	// Check if the current page is full
-	if (curr->write >= PAGE_SIZE) {
-		// Allocate a nenlctl -f
-		// page
-		curr = add_page_node();
-		if (!curr) {
-			pr_err("Failed to add new page node");
-			return;
-		}
-	}
-
-	// Map the page to a virtual address
-	virt_addr = kmap(curr->page);
-	if (!virt_addr) {
-		pr_err("Failed to map page to virtual address");
-		return;
-	}
 	if (new_char == '\0') {
 		pr_warn("EOF offset");
-		print_lu((curr->write + 1));
 		new_char = '\xFF';
+		atomic_inc(&asgn2_device.file_count);
 		/* atomic_set(&asgn2_device.data_ready, 1); */
 		/* wake_up_interruptible(&asgn2_device.data_queue); */
 	}
 
-	// Write the byte to the page
-	*((char *)virt_addr + curr->write) = new_char;
-	curr->write++;
-
-	kunmap(curr->page);
-
-	// Update the total data size of the device
-	asgn2_device.data_size++;
-	/* print_int(asgn2_device.data_size); */
+	d_list_write(&asgn2_device.dlist, new_char);
 }
 static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);
 
@@ -342,13 +357,14 @@ int __init gpio_dummy_init(void)
 	pr_info("Successfully created proc entry");
 
 	/* Initialise fields */
-	INIT_LIST_HEAD(&asgn2_device.mem_list);
+	INIT_LIST_HEAD(&asgn2_device.dlist.head);
 	asgn2_device.num_pages = 0;
 	atomic_set(&asgn2_device.nprocs, 0);
 	atomic_set(&asgn2_device.max_nprocs, 1);
 	mutex_init(&asgn2_device.device_mutex);
 	init_waitqueue_head(&asgn2_device.data_queue);
 	atomic_set(&asgn2_device.data_ready, 0);
+	atomic_set(&asgn2_device.file_count, 0);
 	return 0;
 
 	// Cleanup on error occuring
