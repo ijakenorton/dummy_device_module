@@ -1,8 +1,6 @@
 
-#include "linux/atomic/atomic-instrumented.h"
-#include "linux/highmem-internal.h"
-#include "ring_buffer.h"
 #define BUF_SIZE 2000
+#include "ring_buffer.h"
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
 #define MYIOC_TYPE 'k'
@@ -22,6 +20,7 @@
 #include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/wait.h>
+#include <linux/list.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
 #include <asm/switch_to.h>
@@ -32,9 +31,18 @@
 typedef struct page_node_rec {
 	struct list_head list;
 	struct page *page;
-	unsigned long write_offset;
-	unsigned long read_offset;
+	char *write_mapped;
+	char *read_mapped;
+	char *base_address;
 } page_node;
+
+typedef struct {
+	struct list_head head;
+	page_node *read;
+	page_node *write;
+	size_t count;
+
+} d_list_t;
 
 typedef struct gpio_dev_t {
 	dev_t dev; /* the device */
@@ -59,6 +67,37 @@ int asgn2_minor = 0; /* minor number of module */
 int asgn2_dev_count = 1; /* number of devices */
 struct proc_dir_entry *entry;
 gpio_dev asgn2_device;
+page_node *allocate_node(void)
+{
+	page_node *new_node = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
+	if (!new_node) {
+		pr_err("Failed to allocate cache memory");
+		return NULL;
+	}
+	new_node->page = alloc_page(GFP_KERNEL);
+	if (!new_node->page) {
+		kmem_cache_free(asgn2_device.cache, new_node);
+		pr_err("Failed to allocate memory");
+		return NULL;
+	}
+
+	new_node->base_address = (char *)kmap_local_page(new_node->page);
+	new_node->write_mapped = new_node->base_address;
+	new_node->read_mapped = new_node->base_address;
+	asgn2_device.num_pages++;
+	return new_node;
+}
+
+page_node *add_page_node(void)
+{
+	page_node *new_node = allocate_node();
+	if (!new_node) {
+		pr_err("Failed to allocate cache memory");
+		return NULL;
+	}
+	list_add_tail(&new_node->list, &asgn2_device.mem_list);
+	return new_node;
+}
 
 void free_memory_pages(void)
 {
@@ -76,6 +115,44 @@ void free_memory_pages(void)
 
 	asgn2_device.data_size = 0;
 	asgn2_device.num_pages = 0;
+}
+
+static inline void d_list_write(d_list_t *list, char value)
+{
+	//handle case were circular is full, add new node between next and previous node
+	if (list->count == (list_count_nodes(&list->head) * PAGE_SIZE)) {
+		page_node *new_node = allocate_node();
+		//expand list
+		__list_add(&new_node->list, list->write->list.prev,
+			   list->write->list.prev);
+		list->write = new_node;
+	}
+	if (list->write->write_mapped ==
+	    list->write->base_address + PAGE_SIZE) {
+	} else {
+		*list->write->write_mapped++ = value;
+	}
+
+	list->write++;
+	if (list->write == list->buf + BUF_SIZE) {
+		list->write = list->buf;
+	}
+	list->count++;
+}
+
+static inline char d_list_read(d_list_t *list)
+{
+	if (list->count == 0) {
+		pr_info("Buffer is empty, cannot read\n");
+		return '\0';
+	}
+	char value = *list->read;
+	list->read++;
+	if (list->read == list->buf + BUF_SIZE) {
+		list->read = list->buf;
+	}
+	list->count--;
+	return value;
 }
 int asgn2_open(struct inode *inode, struct file *filp)
 {
@@ -140,11 +217,11 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 			pr_warn("No page data");
 			return -ENOMEM;
 		}
-		for (size_t i = curr->read_offset; i < PAGE_SIZE; i++) {
+		for (size_t i = curr->read_mapped; i < PAGE_SIZE; i++) {
 			if (available_bytes == asgn2_device.data_size) {
 				pr_warn("Hit data size condition");
 				print_zu(available_bytes);
-				print_lu(curr->read_offset);
+				print_lu(curr->read_mapped);
 				kunmap_local(page_data);
 				num_loops++;
 				goto end_eof_loop;
@@ -152,7 +229,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 			if (page_data[i] == '\xFF') {
 				pr_warn("found eof");
 				print_zu(available_bytes);
-				print_lu(curr->read_offset);
+				print_lu(curr->read_mapped);
 				pr_warn("end eof");
 				kunmap_local(page_data);
 
@@ -167,13 +244,13 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 
 end_eof_loop:
 	if (available_bytes == 0) {
-		curr->read_offset++;
+		curr->read_mapped++;
 		asgn2_device.read_offset++;
 		/* curr->read_offset++; */
 		/* asgn2_device.read_offset++; */
 		pr_warn("Available bytes is 0");
 		print_zu(asgn2_device.read_offset);
-		print_lu(curr->read_offset);
+		print_lu(curr->read_mapped);
 		pr_warn("end available is  0");
 		return 0;
 	}
@@ -186,17 +263,17 @@ end_eof_loop:
 			pr_warn("No page data");
 			return -ENOMEM;
 		}
-		for (size_t i = curr->read_offset; i < PAGE_SIZE; i++) {
+		for (size_t i = curr->read_mapped; i < PAGE_SIZE; i++) {
 			//add to kernel buffer for writing
 			if (size_written < size_to_read) {
 				kernel_buf[size_written++] = page_data[i];
 			} else if (i >= available_bytes) {
 				pr_warn("i >= available_bytes");
-				print_lu(curr->read_offset);
+				print_lu(curr->read_mapped);
 				kunmap_local(page_data);
 				goto end_write_loop;
 			}
-			curr->read_offset++;
+			curr->read_mapped++;
 		}
 
 		kunmap_local(page_data);

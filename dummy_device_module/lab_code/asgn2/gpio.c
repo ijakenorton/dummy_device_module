@@ -170,25 +170,6 @@ void printbits(u8 byte)
 	}
 	pr_info("bits: %s", bits);
 }
-page_node *add_page_node(void)
-{
-	page_node *new_node = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
-	if (!new_node) {
-		pr_err("Failed to allocate cache memory");
-		return NULL;
-	}
-	new_node->page = alloc_page(GFP_KERNEL);
-	if (!new_node->page) {
-		kmem_cache_free(asgn2_device.cache, new_node);
-		pr_err("Failed to allocate memory");
-		return NULL;
-	}
-	new_node->write_offset = 0;
-	new_node->read_offset = 0;
-	list_add_tail(&new_node->list, &asgn2_device.mem_list);
-	asgn2_device.num_pages++;
-	return new_node;
-}
 
 static void copy_to_mem_list(unsigned long t_arg)
 {
@@ -210,9 +191,9 @@ static void copy_to_mem_list(unsigned long t_arg)
 	}
 
 	// Check if the current page is full
-	if (curr->write_offset >= PAGE_SIZE) {
-		/* flush_dcache_page(curr->page); */
-		// Allocate a new page
+	if (curr->write >= PAGE_SIZE) {
+		// Allocate a nenlctl -f
+		// page
 		curr = add_page_node();
 		if (!curr) {
 			pr_err("Failed to add new page node");
@@ -228,15 +209,15 @@ static void copy_to_mem_list(unsigned long t_arg)
 	}
 	if (new_char == '\0') {
 		pr_warn("EOF offset");
-		print_lu((curr->write_offset + 1));
+		print_lu((curr->write + 1));
 		new_char = '\xFF';
 		/* atomic_set(&asgn2_device.data_ready, 1); */
 		/* wake_up_interruptible(&asgn2_device.data_queue); */
 	}
 
 	// Write the byte to the page
-	*((char *)virt_addr + curr->write_offset) = new_char;
-	curr->write_offset++;
+	*((char *)virt_addr + curr->write) = new_char;
+	curr->write++;
 
 	kunmap(curr->page);
 
