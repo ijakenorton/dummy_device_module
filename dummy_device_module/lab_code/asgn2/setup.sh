@@ -13,7 +13,7 @@ sudo chown pi:pi /proc/asgn2_proc
 
 echo "Setup $module_name successfully."
 
-# sudo ./data_generator ./asgn2.c
+sudo ./data_generator ./asgn2.c
 # sudo rmmod gpio
 # sudo chown pi:pi /dev/"$module_name"
 

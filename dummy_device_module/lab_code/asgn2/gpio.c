@@ -229,6 +229,7 @@ void printbits(u8 byte)
 static void copy_to_mem_list(unsigned long t_arg)
 {
 	char new_char = ringbuffer_read(&ring_buffer);
+	asgn2_device.data_size++;
 
 	if (new_char == '\0') {
 		pr_warn("EOF offset");
@@ -360,7 +361,7 @@ int __init gpio_dummy_init(void)
 	asgn2_device.num_pages = 0;
 	atomic_set(&asgn2_device.nprocs, 0);
 	atomic_set(&asgn2_device.max_nprocs, 1);
-	mutex_init(&asgn2_device.device_mutex);
+	/* mutex_init(&asgn2_device.device_mutex); */
 	init_waitqueue_head(&asgn2_device.data_queue);
 	atomic_set(&asgn2_device.data_ready, 0);
 	atomic_set(&asgn2_device.file_count, 0);
@@ -396,7 +397,7 @@ void __exit gpio_dummy_exit(void)
 	device_destroy(asgn2_device.class, asgn2_device.dev);
 	class_destroy(asgn2_device.class);
 	unregister_chrdev_region(asgn2_device.dev, 1);
-	mutex_destroy(&asgn2_device.device_mutex);
+	/* mutex_destroy(&asgn2_device.device_mutex); */
 }
 
 module_init(gpio_dummy_init);
