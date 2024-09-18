@@ -29,6 +29,11 @@
 #include <asm/system.h>
 #endif
 
+#define EMPTY (-1)
+#define POINTER_OVERLAP (-2)
+#define MY_EOF (-3)
+#define SENTINEL '\xFF'
+char read_buf[PAGE_SIZE] = { 0 };
 typedef struct page_node_rec {
 	struct list_head list;
 	struct page *page;
@@ -139,10 +144,11 @@ void d_list_write(d_list_t *dlist, char value)
 		dlist->read = new_node;
 		dlist->count = 0;
 	}
-
 	//handle case where circular is full, add new node between next and previous node
-	if (dlist->count == (list_count_nodes(&dlist->head) * PAGE_SIZE)) {
+	if (dlist->count ==
+	    (size_t)(asgn2_device.num_pages * (size_t)PAGE_SIZE)) {
 		pr_warn("list is full");
+		print_zu((size_t)(asgn2_device.num_pages * (size_t)PAGE_SIZE));
 		new_node = allocate_node();
 		//expand list
 		__list_add(&new_node->list, dlist->write->list.prev,
@@ -157,13 +163,16 @@ void d_list_write(d_list_t *dlist, char value)
 		dlist->write = list_next_entry_circular(dlist->write,
 							&dlist->head, list);
 		// remove any old data from the count
-		dlist->count -= (size_t)(dlist->write->write_mapped -
-					 dlist->write->base_address);
-
+		if (dlist->count >= PAGE_SIZE) {
+			dlist->count -= PAGE_SIZE;
+		} else {
+			dlist->count = 0;
+			// Handle error or unexpected case
+		}
 		//set write pointer to base_address of the page
 		dlist->write->write_mapped = dlist->write->base_address;
 	}
-	pr_warn("writing %c", value);
+	/* pr_warn("writing %c", value); */
 	*dlist->write->write_mapped++ = value;
 	/* print_zu(dlist->count); */
 	dlist->count++;
@@ -208,7 +217,11 @@ int d_list_read(d_list_t *dlist, char *value)
 	//shouldnt happen, this should be handled before this point
 	if (dlist->count == 0) {
 		pr_info("Count is zero, cannot read\n");
-		return -1;
+		return EMPTY;
+	}
+	//Read and write are pointing to the same place, read needs to wait for more data
+	if (dlist->read->read_mapped == dlist->write->write_mapped) {
+		return POINTER_OVERLAP;
 	}
 
 	// move to the next page if we are at the end of this one
@@ -218,9 +231,37 @@ int d_list_read(d_list_t *dlist, char *value)
 		//set read pointer to base_address of the page
 		dlist->read->read_mapped = dlist->read->base_address;
 	}
-	*value = *dlist->read->read_mapped++;
+	*value = *dlist->read->read_mapped;
+	dlist->read->read_mapped++;
 	dlist->count--;
 	return 1;
+}
+
+int d_list_peek(d_list_t *dlist)
+{
+	//shouldnt happen, this should be handled before this point
+	if (dlist->count == 0) {
+		pr_info("Count is zero, cannot read\n");
+		return EMPTY;
+	}
+	//Read and write are pointing to the same place, read needs to wait for more data
+	if (dlist->read->read_mapped == dlist->write->write_mapped) {
+		return POINTER_OVERLAP;
+	}
+
+	// move to the next page if we are at the end of this one
+	if (dlist->read->read_mapped == dlist->read->base_address + PAGE_SIZE) {
+		dlist->read = list_next_entry_circular(dlist->read,
+						       &dlist->head, list);
+		//set read pointer to base_address of the page
+		dlist->read->read_mapped = dlist->read->base_address;
+	}
+	char value = *dlist->read->read_mapped;
+	if (value == SENTINEL) {
+		pr_info("Peeked and found EOF");
+		return MY_EOF;
+	}
+	return 0;
 }
 int asgn2_open(struct inode *inode, struct file *filp)
 {
@@ -236,6 +277,7 @@ int asgn2_open(struct inode *inode, struct file *filp)
 		mutex_unlock(&asgn2_device.device_mutex);
 		return -EACCES; // Return "Permission denied" for non-read-only access
 	}
+	/* if(asgn2_device.dlist.count != 0 */
 
 	// Increment process count (should always be 1 at this point)
 	atomic_inc(&asgn2_device.nprocs);
@@ -258,11 +300,9 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		   loff_t *f_pos)
 {
 	size_t size_to_read = 0;
-	size_t remaining_file_size = 0;
 	int rv = 0;
 	page_node *curr, *temp;
 	char value;
-	char *kernel_buf;
 	size_t size_written = 0;
 
 	/* 	// Wait for data if the buffer is empty */
@@ -284,43 +324,56 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	/* } */
 	//find first EOF
 	//find is not working properly!
-	remaining_file_size = d_list_find(&asgn2_device.dlist, '\xFF') - 1;
-	print_zu(remaining_file_size);
 
-	if (remaining_file_size == 0) {
-		/* d_list_read(&asgn2_device.dlist, &value); */
-		pr_warn("Remaining file size is 0");
-		/* print_zu(asgn2_device.read_offset); */
-		/* print_lu(curr->read_mapped); */
-		pr_warn("end available is  0");
-		return 0;
-	}
-	size_to_read = min(remaining_file_size, count);
-	if (size_to_read > 500) {
-		pr_warn("size to read is wrong");
-		print_zu(size_to_read);
-		return -1;
-	}
+	size_to_read = min(asgn2_device.dlist.count, count);
+	/* if (size_to_read > 1000) { */
+	/* 	pr_warn("size to read is wrong"); */
+	/* 	print_zu(size_to_read); */
+	/* 	return -1; */
+	/* } */
 
-	kernel_buf = kmalloc(size_to_read, GFP_KERNEL);
+	while (size_written < size_to_read && size_written < PAGE_SIZE) {
+		switch (d_list_peek(&asgn2_device.dlist)) {
+		case EMPTY:
+			//need to wait?
 
-	while (d_list_read(&asgn2_device.dlist, &value) != -1 &&
-	       size_written < size_to_read) {
-		/* print_char(value); */
-		if (value == '\xFF') {
-			pr_warn("got to the end of file");
-			atomic_dec(&asgn2_device.file_count);
+			return 0;
 			break;
+		case POINTER_OVERLAP:
+			if (size_written != 0)
+				goto end_write_loop;
+			else {
+				//wait
+				break;
+			}
+
+		case MY_EOF:
+			if (size_written == 0) {
+				atomic_dec(&asgn2_device.file_count);
+				d_list_read(&asgn2_device.dlist, &value);
+				return 0;
+			}
+
+			pr_warn("got to the end of file");
+			goto end_write_loop;
+			break;
+		default:
+			d_list_read(&asgn2_device.dlist, &value);
 		}
-		*(kernel_buf + size_written) = value;
+
+		//need to wait?
+
+		/* print_char(value); */
+		*(read_buf + size_written) = value;
 		size_written++;
+		*f_pos += 1;
 	}
-	pr_info("%s", kernel_buf);
+	/* pr_info("%s", read_buf); */
 
 end_write_loop:
 	if (size_written != 0) {
 		size_t size_not_read =
-			copy_to_user(buf, kernel_buf, size_written);
+			copy_to_user(buf, read_buf, size_written);
 		if (size_not_read != 0) {
 			if (size_written > 0) {
 				rv = size_written - size_not_read;
@@ -336,7 +389,6 @@ end:
 
 	/* *f_pos += remaining_file_size; */
 
-	kfree(kernel_buf);
 	return rv;
 }
 /* ssize_t _asgn2_read(struct file *filp, char __user *buf, size_t count, */
