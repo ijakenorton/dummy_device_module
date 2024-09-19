@@ -12,7 +12,7 @@ cleanup
 
 mkdir -p $TEST_DIR
 for i in {1..5}; do
-    < /dev/urandom tr -dc 'A-Za-z' | head -c 10000 | fold -w 100 > "${TEST_DIR}/file${i}.txt"
+    < /dev/urandom tr -dc 'A-Za-z0-9 ' | head -c 10000 | fold -w 100 > "${TEST_DIR}/file${i}.txt"
 done
 
 rm ./combined.txt

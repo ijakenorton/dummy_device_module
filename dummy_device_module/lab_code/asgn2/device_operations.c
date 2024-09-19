@@ -32,7 +32,7 @@
 #define EMPTY (-1)
 #define POINTER_OVERLAP (-2)
 #define MY_EOF (-3)
-#define SENTINEL '\xFF'
+#define SENTINEL '\0'
 char read_buf[PAGE_SIZE] = { 0 };
 typedef struct page_node_rec {
 	struct list_head list;

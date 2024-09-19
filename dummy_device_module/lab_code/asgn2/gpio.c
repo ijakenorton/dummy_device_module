@@ -233,7 +233,7 @@ static void copy_to_mem_list(unsigned long t_arg)
 
 	if (new_char == '\0') {
 		pr_err("END OF WRITE");
-		new_char = '\xFF';
+		new_char = SENTINEL;
 		atomic_inc(&asgn2_device.file_count);
 		/* atomic_set(&asgn2_device.data_ready, 1); */
 		/* wake_up_interruptible(&asgn2_device.data_queue); */
