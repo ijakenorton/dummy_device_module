@@ -235,8 +235,6 @@ static void copy_to_mem_list(unsigned long t_arg)
 		pr_err("END OF WRITE");
 		new_char = SENTINEL;
 		atomic_inc(&asgn2_device.file_count);
-		/* atomic_set(&asgn2_device.data_ready, 1); */
-		/* wake_up_interruptible(&asgn2_device.data_queue); */
 	}
 	d_list_write(&asgn2_device.dlist, new_char);
 	smp_mb(); // Full memory barrier
@@ -254,12 +252,8 @@ irqreturn_t dummyport_interrupt(int irq, void *dev_id)
 	} else {
 		one_byte |=
 			half; // Combine with the second half in the lower 4 bits
-		/* pr_info("Combined byte: 0x%02X ('%c')", one_byte, */
-		/* 	(one_byte >= 32 && one_byte <= 126) ? one_byte : '.'); */
 		first_half = true;
 		ringbuffer_write(&ring_buffer, one_byte);
-		//might be good to initialise this to NULL
-		/* circular_tasklet.data = (unsigned long)NULL; */
 		tasklet_schedule(&circular_tasklet);
 		one_byte = 0;
 	}
@@ -362,8 +356,9 @@ int __init gpio_dummy_init(void)
 	asgn2_device.num_pages = 0;
 	atomic_set(&asgn2_device.nprocs, 0);
 	atomic_set(&asgn2_device.max_nprocs, 1);
-	/* mutex_init(&asgn2_device.device_mutex); */
-	init_waitqueue_head(&asgn2_device.data_queue);
+	mutex_init(&asgn2_device.device_mutex);
+	init_waitqueue_head(&asgn2_device.open_queue);
+	init_waitqueue_head(&asgn2_device.ptr_overlap_queue);
 	atomic_set(&asgn2_device.data_ready, 0);
 	atomic_set(&asgn2_device.file_count, 0);
 	return 0;
@@ -398,7 +393,7 @@ void __exit gpio_dummy_exit(void)
 	device_destroy(asgn2_device.class, asgn2_device.dev);
 	class_destroy(asgn2_device.class);
 	unregister_chrdev_region(asgn2_device.dev, 1);
-	/* mutex_destroy(&asgn2_device.device_mutex); */
+	mutex_destroy(&asgn2_device.device_mutex);
 }
 
 module_init(gpio_dummy_init);

@@ -62,7 +62,8 @@ typedef struct gpio_dev_t {
 	atomic_t max_nprocs; /* max number of processes accessing this device */
 	atomic_t data_ready;
 	atomic_t file_count;
-	wait_queue_head_t data_queue;
+	wait_queue_head_t open_queue;
+	wait_queue_head_t ptr_overlap_queue;
 	struct mutex device_mutex;
 	struct kmem_cache *cache; /* cache memory */
 	struct class *class; /* the udev class */
@@ -270,19 +271,19 @@ int d_list_peek(d_list_t *dlist)
 }
 int asgn2_open(struct inode *inode, struct file *filp)
 {
-	/* int ret; */
-
 	// Wait until the device is available
-	/* ret = mutex_lock_interruptible(&asgn2_device.device_mutex); */
-	/* if (ret) */
-	/* 	return ret; // Return -ERESTARTSYS if interrupted */
+	if (wait_event_interruptible(asgn2_device.open_queue,
+				     asgn2_device.dlist.count > 0))
+		return -ERESTARTSYS;
 
+	int ret = mutex_lock_interruptible(&asgn2_device.device_mutex);
+	if (ret)
+		return ret; // Return -ERESTARTSYS if interrupted
 	// Check if it's opened for reading (read-only device)
-	/* if ((filp->f_flags & O_ACCMODE) != O_RDONLY) { */
-	/* 	mutex_unlock(&asgn2_device.device_mutex); */
-	/* 	return -EACCES; // Return "Permission denied" for non-read-only access */
-	/* } */
-	/* if(asgn2_device.dlist.count != 0 */
+	if ((filp->f_flags & O_ACCMODE) != O_RDONLY) {
+		mutex_unlock(&asgn2_device.device_mutex);
+		return -EACCES; // Return "Permission denied" for non-read-only access
+	}
 
 	// Increment process count (should always be 1 at this point)
 	atomic_inc(&asgn2_device.nprocs);
@@ -296,7 +297,7 @@ int asgn2_release(struct inode *inode, struct file *filp)
 	atomic_dec(&asgn2_device.nprocs);
 
 	// Release the mutex to allow other processes to open the device
-	/* mutex_unlock(&asgn2_device.device_mutex); */
+	mutex_unlock(&asgn2_device.device_mutex);
 
 	return 0;
 }
@@ -337,28 +338,21 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	/* 	print_zu(size_to_read); */
 	/* 	return -1; */
 	/* } */
-
+loop_start:
 	while (size_written < size_to_read && size_written < PAGE_SIZE) {
 		switch (d_list_peek(&asgn2_device.dlist)) {
 		case EMPTY:
 			pr_info("empty");
-			//need to wait?
-
-			return 0;
-			break;
-		case POINTER_OVERLAP:
-			pr_info("pointer overlap");
-			if (size_written != 0)
-				goto end_write_loop;
-			else {
-				//wait
-				return 0;
-
-				break;
+			if (wait_event_interruptible(
+				    asgn2_device.ptr_overlap_queue,
+				    asgn2_device.dlist.read->read_mapped !=
+					    asgn2_device.dlist.write
+						    ->write_mapped)) {
+				return -ERESTARTSYS;
 			}
+			goto loop_start;
 
 		case MY_EOF:
-
 			pr_info("EOF");
 			if (size_written == check) {
 				atomic_dec(&asgn2_device.file_count);
@@ -370,6 +364,22 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 			pr_warn("got to the end of file");
 			goto end_write_loop;
 			break;
+
+		case POINTER_OVERLAP:
+			if (size_written != 0)
+				goto end_write_loop;
+			else {
+				pr_info("pointer overlap waiting");
+				if (wait_event_interruptible(
+					    asgn2_device.ptr_overlap_queue,
+					    asgn2_device.dlist.read
+							    ->read_mapped !=
+						    asgn2_device.dlist.write
+							    ->write_mapped)) {
+					return -ERESTARTSYS;
+				}
+				goto loop_start;
+			}
 		default:
 			if (d_list_read(&asgn2_device.dlist, &value) == EMPTY) {
 				pr_info("Hit empty in read");
@@ -377,8 +387,6 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 			smp_mb(); // Full barrier after reading from d_list
 			asgn2_device.data_size--;
 		}
-
-		//need to wait?
 
 		/* print_char(value); */
 		*(read_buf + size_written) = value;
