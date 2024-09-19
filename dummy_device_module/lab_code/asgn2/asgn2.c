@@ -92,6 +92,11 @@ int asgn2_dev_count = 1; /* number of devices */
  * This function frees all memory pages held by the module.
  */
 
+irqreturn_t dummyport_interrupt(int irq, void *dev_id)
+{
+	pr_info("recieved interupt");
+	return IRQ_NONE;
+}
 void free_memory_pages(void)
 {
 	page_node *curr;

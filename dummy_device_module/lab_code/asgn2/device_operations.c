@@ -242,6 +242,7 @@ int d_list_read(d_list_t *dlist, char *value)
 
 int d_list_peek(d_list_t *dlist)
 {
+	print_list_structure(dlist);
 	//shouldnt happen, this should be handled before this point
 	if (dlist->count == 0) {
 		pr_info("Count is zero, cannot read\n");
@@ -329,6 +330,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	//find first EOF
 	//find is not working properly!
 
+	smp_rmb();
 	size_to_read = min(asgn2_device.dlist.count, count);
 	/* if (size_to_read > 1000) { */
 	/* 	pr_warn("size to read is wrong"); */
@@ -360,6 +362,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 			pr_info("EOF");
 			if (size_written == check) {
 				atomic_dec(&asgn2_device.file_count);
+				smp_mb(); // Full barrier after modifying atomic variable
 				d_list_read(&asgn2_device.dlist, &value);
 				return 0;
 			}
@@ -371,6 +374,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 			if (d_list_read(&asgn2_device.dlist, &value) == EMPTY) {
 				pr_info("Hit empty in read");
 			}
+			smp_mb(); // Full barrier after reading from d_list
 			asgn2_device.data_size--;
 		}
 
@@ -384,6 +388,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	/* pr_info("%s", read_buf); */
 
 end_write_loop:
+	smp_wmb();
 	if (size_written != 0) {
 		size_t size_not_read =
 			copy_to_user(buf, read_buf, size_written);

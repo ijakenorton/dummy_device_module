@@ -232,13 +232,14 @@ static void copy_to_mem_list(unsigned long t_arg)
 	asgn2_device.data_size++;
 
 	if (new_char == '\0') {
-		pr_warn("EOF offset");
+		pr_err("END OF WRITE");
 		new_char = '\xFF';
 		atomic_inc(&asgn2_device.file_count);
 		/* atomic_set(&asgn2_device.data_ready, 1); */
 		/* wake_up_interruptible(&asgn2_device.data_queue); */
 	}
 	d_list_write(&asgn2_device.dlist, new_char);
+	smp_mb(); // Full memory barrier
 }
 static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);
 
