@@ -1,5 +1,5 @@
 
-#include "linux/atomic/atomic-instrumented.h"
+#include "asm-generic/errno-base.h"
 #define BUF_SIZE 2000
 #include "ring_buffer.h"
 #define MYDEV_NAME "asgn2"
@@ -22,6 +22,7 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/list.h>
+#include <linux/workqueue.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
 #include <asm/switch_to.h>
@@ -29,9 +30,9 @@
 #include <asm/system.h>
 #endif
 
-#define EMPTY (-1)
-#define POINTER_OVERLAP (-2)
-#define MY_EOF (-3)
+#define EMPTY (1)
+#define POINTER_OVERLAP (2)
+#define MY_EOF (3)
 #define SENTINEL '\0'
 char read_buf[PAGE_SIZE] = { 0 };
 typedef struct page_node_rec {
@@ -48,8 +49,13 @@ typedef struct {
 	struct list_head head;
 	page_node *read;
 	page_node *write;
-	size_t count;
+	atomic_t count;
 } d_list_t;
+
+struct write_work {
+	struct work_struct work;
+	char value;
+};
 
 typedef struct gpio_dev_t {
 	dev_t dev; /* the device */
@@ -60,10 +66,11 @@ typedef struct gpio_dev_t {
 	size_t read_offset;
 	atomic_t nprocs; /* number of processes accessing this device */
 	atomic_t max_nprocs; /* max number of processes accessing this device */
-	atomic_t data_ready;
+	atomic_t waiting_for_data;
 	atomic_t file_count;
 	wait_queue_head_t open_queue;
 	wait_queue_head_t ptr_overlap_queue;
+	struct workqueue_struct *write_queue;
 	struct mutex device_mutex;
 	struct kmem_cache *cache; /* cache memory */
 	struct class *class; /* the udev class */
@@ -94,7 +101,7 @@ page_node *allocate_node(void)
 	new_node->write_mapped = new_node->base_address;
 	new_node->read_mapped = new_node->base_address;
 	new_node->position = -1;
-	/* mutex_init(&new_node->page_mutex); */
+	mutex_init(&new_node->page_mutex);
 	asgn2_device.num_pages++;
 	return new_node;
 }
@@ -105,7 +112,7 @@ void update_node_positions(d_list_t *dlist)
 	int position = 0;
 
 	list_for_each_entry(node, &dlist->head, list) {
-		pr_info("Updating position to %d", position);
+		/* pr_info("Updating position to %d", position); */
 		node->position = position++;
 	}
 }
@@ -116,8 +123,8 @@ void print_list_structure(d_list_t *dlist)
 
 	pr_info("Current read node position: %d\n", dlist->read->position);
 	pr_info("Current write node position: %d\n", dlist->write->position);
-	pr_info("List structure: count=%zu, max_size=%lu\n", dlist->count,
-		asgn2_device.num_pages * PAGE_SIZE);
+	pr_info("List structure: count=%zu, max_size=%lu\n",
+		atomic_read(&dlist->count), asgn2_device.num_pages * PAGE_SIZE);
 
 	list_for_each(pos, &dlist->head) {
 		node = list_entry(pos, page_node, list);
@@ -145,6 +152,7 @@ void free_memory_pages(void)
 
 	list_for_each_entry_safe(curr, tmp, &asgn2_device.dlist.head, list) {
 		if (curr->page) {
+			mutex_destroy(&curr->page_mutex);
 			kunmap_local(curr->base_address);
 			__free_page(curr->page);
 			curr->page = NULL;
@@ -162,123 +170,195 @@ void free_memory_pages(void)
 void d_list_write(d_list_t *dlist, char value)
 {
 	page_node *new_node;
+	int ret;
 	if (list_empty(&dlist->head)) {
 		pr_warn("list is empty");
 		new_node = allocate_node();
-		list_add_tail(&new_node->list, &dlist->head);
-		update_node_positions(dlist);
 
 		if (!new_node) {
 			pr_err("Failed to allocate node");
+			return;
 		}
+		ret = mutex_lock_interruptible(&new_node->page_mutex);
+		if (ret) {
+			return;
+		}
+		list_add_tail(&new_node->list, &dlist->head);
+		update_node_positions(dlist);
+
 		dlist->write = new_node;
 		dlist->read = new_node;
-		dlist->count = 0;
-		print_list_structure(dlist);
+		goto write;
+		/* dlist->count = 0; */
+		/* print_list_structure(dlist); */
 	}
 
+	//Assumes we have at least one page
+	mutex_lock(&dlist->read->page_mutex);
 	if (dlist->write->write_mapped ==
 		    dlist->write->base_address + (int)PAGE_SIZE &&
-	    dlist->count != asgn2_device.num_pages * (int)PAGE_SIZE) {
+	    atomic_read(&dlist->count) !=
+		    asgn2_device.num_pages * (int)PAGE_SIZE) {
 		pr_warn("page is full");
 
-		print_list_structure(dlist);
+		struct mutex temp = dlist->read->page_mutex;
+		/* print_list_structure(dlist); */
 		//move to next page node
 		dlist->write = list_next_entry_circular(dlist->write,
 							&dlist->head, list);
+
+		//slight concern about the timing here
+		mutex_unlock(&temp);
+
+		mutex_lock(&dlist->read->page_mutex);
 		//set write pointer to base_address of the page
 		dlist->write->write_mapped = dlist->write->base_address;
+		goto write;
 
-		print_list_structure(dlist);
+		/* print_list_structure(dlist); */
 	}
 
 	//handle case where circular is full, add new node between next and previous node
 	//
-	if (dlist->count == asgn2_device.num_pages * (int)PAGE_SIZE) {
+	if (atomic_read(&dlist->count) ==
+	    asgn2_device.num_pages * (int)PAGE_SIZE) {
 		pr_warn("list is full");
 		new_node = allocate_node();
+		if (!new_node) {
+			pr_err("Failed to allocate node");
+			return;
+		}
 		//expand list
-		print_list_structure(dlist);
+		/* print_list_structure(dlist); */
+
+		mutex_lock(&new_node->page_mutex);
 		__list_add(&new_node->list, &dlist->write->list,
 			   dlist->write->list.next);
 
 		update_node_positions(&asgn2_device.dlist);
 		dlist->write = new_node;
-		print_list_structure(dlist);
+
+		/* print_list_structure(dlist); */
 		//
 	}
 
-	if (dlist->count > asgn2_device.num_pages * (int)PAGE_SIZE) {
+write:
+	// ASSERT to catch errors if something went wrong with the state
+	// Can possibly use atomic_read_inc()
+	if (atomic_read(&dlist->count) >
+	    asgn2_device.num_pages * (int)PAGE_SIZE) {
 		pr_err("d_list_write: count exceeded max_size\n");
-		// Handle this error condition
+		return;
 	}
 	// current page is full, moving to next element and resetting its write pointer
 	/* pr_warn("writing %c", value); */
 	*dlist->write->write_mapped++ = value;
 	/* print_zu(dlist->count); */
-	dlist->count++;
-}
-
-int d_list_read(d_list_t *dlist, char *value)
-{
-	//shouldnt happen, this should be handled before this point
-	if (dlist->count == 0) {
-		pr_info("Count is zero, cannot read\n");
-		return EMPTY;
+	atomic_inc(&dlist->count);
+	if (atomic_read(&asgn2_device.waiting_for_data) != 0) {
+		wake_up_interruptible(&asgn2_device.ptr_overlap_queue);
 	}
 
-	// move to the next page if we are at the end of this one
-	if (dlist->read->read_mapped ==
-	    dlist->read->base_address + (int)PAGE_SIZE) {
-		dlist->read = list_next_entry_circular(dlist->read,
-						       &dlist->head, list);
-		//set read pointer to base_address of the page
-		dlist->read->read_mapped = dlist->read->base_address;
-	}
-	*value = *dlist->read->read_mapped;
-	dlist->read->read_mapped++;
-	dlist->count--;
-	return 1;
+	mutex_unlock(&dlist->write->page_mutex);
 }
 
 int d_list_peek(d_list_t *dlist)
 {
-	print_list_structure(dlist);
+	int ret;
+	/* print_list_structure(dlist); */
 	//shouldnt happen, this should be handled before this point
-	if (dlist->count == 0) {
+	if (atomic_read(&dlist->count) == 0) {
 		pr_info("Count is zero, cannot read\n");
-		return EMPTY;
+		return -EMPTY;
 	}
 	//Read and write are pointing to the same place, read needs to wait for more data
+	ret = mutex_lock_interruptible(&dlist->read->page_mutex);
+	if (ret) {
+		return -EINTR;
+	}
 	if (dlist->read->read_mapped == dlist->write->write_mapped) {
-		return POINTER_OVERLAP;
+		mutex_unlock(&dlist->read->page_mutex);
+		return -POINTER_OVERLAP;
 	}
 
 	// move to the next page if we are at the end of this one
 	if (dlist->read->read_mapped ==
 	    dlist->read->base_address + (int)PAGE_SIZE) {
+		struct mutex temp = dlist->read->page_mutex;
+
 		dlist->read = list_next_entry_circular(dlist->read,
 						       &dlist->head, list);
+
+		mutex_unlock(&temp);
+
+		ret = mutex_lock_interruptible(&dlist->read->page_mutex);
+		if (ret) {
+			return -EINTR;
+		}
 		//set read pointer to base_address of the page
 		dlist->read->read_mapped = dlist->read->base_address;
 	}
 	char value = *dlist->read->read_mapped;
 	if (value == SENTINEL) {
 		pr_info("Peeked and found EOF");
-		return MY_EOF;
+
+		mutex_unlock(&dlist->write->page_mutex);
+		return -MY_EOF;
 	}
+
+	mutex_unlock(&dlist->write->page_mutex);
 	return 0;
 }
+
+int d_list_read(d_list_t *dlist, char *value)
+{
+	int ret;
+	//shouldnt happen, this should be handled before this point
+	if (atomic_read(&dlist->count) == 0) {
+		pr_info("Count is zero, cannot read\n");
+		return -EMPTY;
+	}
+
+	ret = mutex_lock_interruptible(&dlist->read->page_mutex);
+	if (ret) {
+		return -EINTR;
+	}
+	// move to the next page if we are at the end of this one
+	if (dlist->read->read_mapped ==
+	    dlist->read->base_address + (int)PAGE_SIZE) {
+		struct mutex temp = dlist->read->page_mutex;
+		dlist->read = list_next_entry_circular(dlist->read,
+						       &dlist->head, list);
+
+		mutex_unlock(&temp);
+
+		ret = mutex_lock_interruptible(&dlist->read->page_mutex);
+		if (ret) {
+			return -EINTR;
+		}
+		//set read pointer to base_address of the page
+		dlist->read->read_mapped = dlist->read->base_address;
+	}
+
+	*value = *dlist->read->read_mapped;
+	dlist->read->read_mapped++;
+	atomic_dec(&dlist->count);
+
+	mutex_unlock(&dlist->read->page_mutex);
+	return 0;
+}
+
 int asgn2_open(struct inode *inode, struct file *filp)
 {
 	// Wait until the device is available
 	if (wait_event_interruptible(asgn2_device.open_queue,
-				     asgn2_device.dlist.count > 0))
-		return -ERESTARTSYS;
+				     atomic_read(&asgn2_device.dlist.count) >
+					     0))
+		return -EINTR;
 
 	int ret = mutex_lock_interruptible(&asgn2_device.device_mutex);
 	if (ret)
-		return ret; // Return -ERESTARTSYS if interrupted
+		return ret; // Return -EINTR if interrupted
 	// Check if it's opened for reading (read-only device)
 	if ((filp->f_flags & O_ACCMODE) != O_RDONLY) {
 		mutex_unlock(&asgn2_device.device_mutex);
@@ -306,11 +386,11 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		   loff_t *f_pos)
 {
 	size_t size_to_read = 0;
-	int rv = 0;
-	char value;
 	size_t size_written = 0;
-
 	const size_t check = 0;
+	char value;
+	int rv = 0;
+
 	/* 	// Wait for data if the buffer is empty */
 	/* 	while (asgn2_device.data_size == 0) { */
 	/* 		if (filp->f_flags & O_NONBLOCK) */
@@ -318,7 +398,7 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 
 	/* 		if (wait_event_interruptible(asgn2_device.data_queue, */
 	/* 					     asgn2_device.data_size > 0)) */
-	/* 			return -ERESTARTSYS; */
+	/* 			return -EINTR; */
 	/* 	} */
 	//
 	//To be fixed with proper waiting later
@@ -332,27 +412,28 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 	//find is not working properly!
 
 	smp_rmb();
-	size_to_read = min(asgn2_device.dlist.count, count);
-	/* if (size_to_read > 1000) { */
-	/* 	pr_warn("size to read is wrong"); */
-	/* 	print_zu(size_to_read); */
-	/* 	return -1; */
-	/* } */
 loop_start:
+	//Unsure if cast is ok here
+	size_to_read =
+		min((size_t)atomic_read(&asgn2_device.dlist.count), count);
 	while (size_written < size_to_read && size_written < PAGE_SIZE) {
 		switch (d_list_peek(&asgn2_device.dlist)) {
-		case EMPTY:
-			pr_info("empty");
+		case -EMPTY:
+			pr_warn("EMPTY");
+			atomic_inc(&asgn2_device.waiting_for_data);
 			if (wait_event_interruptible(
 				    asgn2_device.ptr_overlap_queue,
 				    asgn2_device.dlist.read->read_mapped !=
 					    asgn2_device.dlist.write
 						    ->write_mapped)) {
-				return -ERESTARTSYS;
+				return -EINTR;
 			}
+
+			atomic_dec(&asgn2_device.waiting_for_data);
+			pr_warn("finished waiting for empty\n");
 			goto loop_start;
 
-		case MY_EOF:
+		case -MY_EOF:
 			pr_info("EOF");
 			if (size_written == check) {
 				atomic_dec(&asgn2_device.file_count);
@@ -365,10 +446,15 @@ loop_start:
 			goto end_write_loop;
 			break;
 
-		case POINTER_OVERLAP:
-			if (size_written != 0)
+		case -POINTER_OVERLAP:
+			/* if (size_written != 0) */
+			/* 	goto end_write_loop; */
+
+			if (0)
 				goto end_write_loop;
 			else {
+				atomic_inc(&asgn2_device.waiting_for_data);
+				print_zu(size_to_read);
 				pr_info("pointer overlap waiting");
 				if (wait_event_interruptible(
 					    asgn2_device.ptr_overlap_queue,
@@ -376,14 +462,22 @@ loop_start:
 							    ->read_mapped !=
 						    asgn2_device.dlist.write
 							    ->write_mapped)) {
-					return -ERESTARTSYS;
+					return -EINTR;
 				}
+				atomic_dec(&asgn2_device.waiting_for_data);
+
+				pr_warn("finished waiting for pointer overlap\n");
 				goto loop_start;
 			}
 		default:
-			if (d_list_read(&asgn2_device.dlist, &value) == EMPTY) {
-				pr_info("Hit empty in read");
+			switch (d_list_read(&asgn2_device.dlist, &value)) {
+			case -EINTR:
+				return -EINTR;
+
+			case -EMPTY:
+				goto loop_start;
 			}
+
 			smp_mb(); // Full barrier after reading from d_list
 			asgn2_device.data_size--;
 		}
@@ -485,11 +579,13 @@ static void my_seq_stop(struct seq_file *s, void *v)
 
 int my_seq_show(struct seq_file *s, void *v)
 {
+	//Now that count is atomic might not be ideal to poll this...
 	seq_printf(
 		s,
 		"Pages: %d\nMemory: %zu bytes\nCount: %zu\nRead offset %d\nDevices: %d\n",
 		asgn2_device.num_pages, asgn2_device.data_size,
-		asgn2_device.dlist.count, atomic_read(&asgn2_device.file_count),
+		atomic_read(&asgn2_device.dlist.count),
+		atomic_read(&asgn2_device.file_count),
 		atomic_read(&asgn2_device.nprocs));
 	return 0;
 }

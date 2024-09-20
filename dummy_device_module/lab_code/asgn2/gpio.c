@@ -225,7 +225,12 @@ void printbits(u8 byte)
 /* 	asgn2_device.data_size++; */
 /* 	/1* print_int(asgn2_device.data_size); *1/ */
 /* } */
-
+static void write_work_func(struct work_struct *work)
+{
+	struct write_work *w = container_of(work, struct write_work, work);
+	d_list_write(&asgn2_device.dlist, w->value);
+	kfree(w);
+}
 static void copy_to_mem_list(unsigned long t_arg)
 {
 	char new_char = ringbuffer_read(&ring_buffer);
@@ -236,9 +241,18 @@ static void copy_to_mem_list(unsigned long t_arg)
 		new_char = SENTINEL;
 		atomic_inc(&asgn2_device.file_count);
 	}
-	d_list_write(&asgn2_device.dlist, new_char);
+	struct write_work *work = kmalloc(sizeof(*work), GFP_ATOMIC);
+	if (work) {
+		INIT_WORK(&work->work, write_work_func);
+		work->value = new_char;
+		queue_work(asgn2_device.write_queue, &work->work);
+	} else {
+		pr_err("Failed to allocate memory for write work\n");
+	}
+	/* d_list_write(&asgn2_device.dlist, new_char); */
 	smp_mb(); // Full memory barrier
 }
+
 static DECLARE_TASKLET_OLD(circular_tasklet, copy_to_mem_list);
 
 irqreturn_t dummyport_interrupt(int irq, void *dev_id)
@@ -351,18 +365,27 @@ int __init gpio_dummy_init(void)
 	}
 	pr_info("Successfully created proc entry");
 
+	asgn2_device.write_queue =
+		alloc_workqueue("asgn2_write_queue", WQ_UNBOUND, 1);
+	if (!asgn2_device.write_queue) {
+		pr_err("Failed to create write queue\n");
+		ret = -ENOMEM;
+		goto fail_create_workqueue;
+	}
 	/* Initialise fields */
 	INIT_LIST_HEAD(&asgn2_device.dlist.head);
 	asgn2_device.num_pages = 0;
+	atomic_set(&asgn2_device.dlist.count, 0);
 	atomic_set(&asgn2_device.nprocs, 0);
 	atomic_set(&asgn2_device.max_nprocs, 1);
 	mutex_init(&asgn2_device.device_mutex);
 	init_waitqueue_head(&asgn2_device.open_queue);
 	init_waitqueue_head(&asgn2_device.ptr_overlap_queue);
-	atomic_set(&asgn2_device.data_ready, 0);
+	atomic_set(&asgn2_device.waiting_for_data, 0);
 	atomic_set(&asgn2_device.file_count, 0);
 	return 0;
 
+fail_create_workqueue:
 	// Cleanup on error occuring
 fail_proc_create:
 	kmem_cache_destroy(asgn2_device.cache);
@@ -394,6 +417,10 @@ void __exit gpio_dummy_exit(void)
 	class_destroy(asgn2_device.class);
 	unregister_chrdev_region(asgn2_device.dev, 1);
 	mutex_destroy(&asgn2_device.device_mutex);
+	if (asgn2_device.write_queue) {
+		flush_workqueue(asgn2_device.write_queue);
+		destroy_workqueue(asgn2_device.write_queue);
+	}
 }
 
 module_init(gpio_dummy_init);
