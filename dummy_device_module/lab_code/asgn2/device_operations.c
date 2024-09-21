@@ -155,7 +155,7 @@ void free_memory_pages(void)
 	asgn2_device.data_size = 0;
 	asgn2_device.num_pages = 0;
 }
-void free_pages_to_read(void)
+void d_free_pages_up_till_read(void)
 {
 	page_node *curr;
 	page_node *temp;
@@ -182,7 +182,7 @@ void free_pages_to_read(void)
 	}
 }
 
-void free_pages_after_first(void)
+void d_free_pages_after_first(void)
 {
 	page_node *curr;
 	page_node *tmp;
@@ -223,17 +223,33 @@ void d_list_write(d_list_t *dlist, char value)
 		goto write;
 	}
 
+	/* int current_count = atomic_read(&dlist->count); */
+	// Only cleanup if count is < than half of max size
 	if (asgn2_device.num_pages > MIN_PAGE &&
-	    atomic_read(&dlist->count) == 0) {
-		pr_warn("Starting GC");
-		print_zu(asgn2_device.num_pages);
+	    atomic_read(&dlist->count) <
+		    ((asgn2_device.num_pages * (int)PAGE_SIZE) / 2)) {
+		if (atomic_read(&dlist->count) == 0) {
+			pr_warn("Starting free after first GC");
+			d_free_pages_after_first();
+		} else {
+			pr_warn("Starting free till read GC");
+			print_zu(asgn2_device.num_pages);
 
-		node = dlist->write = dlist->read =
-			list_first_entry(&dlist->head, page_node, list);
-
-		node->write_mapped = node->read_mapped = node->base_address;
-		free_pages_after_first();
+			d_free_pages_up_till_read();
+		}
 	}
+
+	/* if (asgn2_device.num_pages > MIN_PAGE && */
+	/*     atomic_read(&dlist->count) == 0) { */
+	/* 	pr_warn("Starting GC"); */
+	/* 	print_zu(asgn2_device.num_pages); */
+
+	/* 	node = dlist->write = dlist->read = */
+	/* 		list_first_entry(&dlist->head, page_node, list); */
+
+	/* 	node->write_mapped = node->read_mapped = node->base_address; */
+	/* 	d_free_pages_after_first(); */
+	/* } */
 
 	//Assumes we have at least one page
 	if (dlist->write->write_mapped ==
