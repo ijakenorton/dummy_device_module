@@ -29,6 +29,8 @@
 #include <asm/system.h>
 #endif
 
+#define MIN_PAGE (5)
+#define MAX_PAGE (100000)
 #define EMPTY (1)
 #define POINTER_OVERLAP (2)
 #define MY_EOF (3)
@@ -153,23 +155,84 @@ void free_memory_pages(void)
 	asgn2_device.data_size = 0;
 	asgn2_device.num_pages = 0;
 }
+void free_pages_to_read(void)
+{
+	page_node *curr;
+	page_node *temp;
+
+	//Modified version of list_for_each_safe to work for circular lists and to break when hit
+	//the current read node
+	for (curr = list_next_entry_circular(asgn2_device.dlist.write,
+					     &asgn2_device.dlist.head, list),
+	    temp = list_next_entry_circular(curr, &asgn2_device.dlist.head,
+					    list);
+	     curr != asgn2_device.dlist.read; curr = temp,
+	    temp = list_next_entry_circular(temp, &asgn2_device.dlist.head,
+					    list)) {
+		if (curr->page) {
+			kunmap_local(curr->base_address);
+			__free_page(curr->page);
+			curr->page = NULL;
+		}
+
+		list_del(&curr->list);
+		kmem_cache_free(asgn2_device.cache, curr);
+
+		asgn2_device.num_pages--;
+	}
+}
+
+void free_pages_after_first(void)
+{
+	page_node *curr;
+	page_node *tmp;
+
+	list_for_each_entry_safe(curr, tmp, &asgn2_device.dlist.head, list) {
+		if (list_is_first(&curr->list, &asgn2_device.dlist.head)) {
+			continue;
+		}
+		if (curr->page) {
+			kunmap_local(curr->base_address);
+			__free_page(curr->page);
+			curr->page = NULL;
+		}
+
+		list_del(&curr->list);
+		kmem_cache_free(asgn2_device.cache, curr);
+	}
+
+	asgn2_device.data_size = 0;
+	asgn2_device.num_pages = 1;
+}
 
 void d_list_write(d_list_t *dlist, char value)
 {
-	page_node *new_node;
+	page_node *node;
 	if (list_empty(&dlist->head)) {
 		pr_warn("list is empty");
-		new_node = allocate_node();
+		node = allocate_node();
 
-		if (!new_node) {
+		if (!node) {
 			pr_err("Failed to allocate node");
 			return;
 		}
-		list_add_tail(&new_node->list, &dlist->head);
+		list_add_tail(&node->list, &dlist->head);
 
-		dlist->write = new_node;
-		dlist->read = new_node;
+		dlist->write = node;
+		dlist->read = node;
 		goto write;
+	}
+
+	if (asgn2_device.num_pages > MIN_PAGE &&
+	    atomic_read(&dlist->count) == 0) {
+		pr_warn("Starting GC");
+		print_zu(asgn2_device.num_pages);
+
+		node = dlist->write = dlist->read =
+			list_first_entry(&dlist->head, page_node, list);
+
+		node->write_mapped = node->read_mapped = node->base_address;
+		free_pages_after_first();
 	}
 
 	//Assumes we have at least one page
@@ -193,15 +256,15 @@ void d_list_write(d_list_t *dlist, char value)
 	if (atomic_read(&dlist->count) ==
 	    asgn2_device.num_pages * (int)PAGE_SIZE) {
 		pr_warn("list is full");
-		new_node = allocate_node();
-		if (!new_node) {
+		node = allocate_node();
+		if (!node) {
 			pr_err("Failed to allocate node");
 			return;
 		}
-		__list_add(&new_node->list, &dlist->write->list,
+		__list_add(&node->list, &dlist->write->list,
 			   dlist->write->list.next);
 
-		dlist->write = new_node;
+		dlist->write = node;
 	}
 
 write:
