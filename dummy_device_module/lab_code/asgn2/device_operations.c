@@ -22,7 +22,6 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/list.h>
-#include <linux/workqueue.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
 #include <asm/switch_to.h>
@@ -41,7 +40,6 @@ typedef struct page_node_rec {
 	char *write_mapped;
 	char *read_mapped;
 	char *base_address;
-	struct mutex page_mutex;
 	int position;
 } page_node;
 
@@ -52,11 +50,6 @@ typedef struct {
 	atomic_t count;
 } d_list_t;
 
-struct write_work {
-	struct work_struct work;
-	char value;
-};
-
 typedef struct gpio_dev_t {
 	dev_t dev; /* the device */
 	struct cdev cdev;
@@ -66,11 +59,8 @@ typedef struct gpio_dev_t {
 	size_t read_offset;
 	atomic_t nprocs; /* number of processes accessing this device */
 	atomic_t max_nprocs; /* max number of processes accessing this device */
-	atomic_t waiting_for_data;
 	atomic_t file_count;
-	wait_queue_head_t open_queue;
 	wait_queue_head_t ptr_overlap_queue;
-	struct workqueue_struct *write_queue;
 	struct mutex device_mutex;
 	struct kmem_cache *cache; /* cache memory */
 	struct class *class; /* the udev class */
@@ -101,7 +91,6 @@ page_node *allocate_node(void)
 	new_node->write_mapped = new_node->base_address;
 	new_node->read_mapped = new_node->base_address;
 	new_node->position = -1;
-	mutex_init(&new_node->page_mutex);
 	asgn2_device.num_pages++;
 	return new_node;
 }
@@ -115,6 +104,7 @@ void update_node_positions(d_list_t *dlist)
 		node->position = position++;
 	}
 }
+// Utility function for looking at the current state of the dynamic list
 void print_list_structure(d_list_t *dlist)
 {
 	struct list_head *pos;
@@ -151,7 +141,6 @@ void free_memory_pages(void)
 
 	list_for_each_entry_safe(curr, tmp, &asgn2_device.dlist.head, list) {
 		if (curr->page) {
-			mutex_destroy(&curr->page_mutex);
 			kunmap_local(curr->base_address);
 			__free_page(curr->page);
 			curr->page = NULL;
@@ -184,7 +173,6 @@ void d_list_write(d_list_t *dlist, char value)
 	}
 
 	//Assumes we have at least one page
-	/* mutex_lock(&dlist->read->page_mutex); */
 	if (dlist->write->write_mapped ==
 		    dlist->write->base_address + (int)PAGE_SIZE &&
 	    atomic_read(&dlist->count) !=
@@ -225,7 +213,6 @@ write:
 		return;
 	}
 	// current page is full, moving to next element and resetting its write pointer
-	/* pr_warn("writing %c", value); */
 	*dlist->write->write_mapped++ = value;
 	/* print_zu(dlist->count); */
 	if (atomic_fetch_inc(&dlist->count) == 0) {
