@@ -162,77 +162,9 @@ static u8 one_byte = 0;
 static bool first_half = true;
 DECLARE_RINGBUFFER(ring_buffer);
 
-void printbits(u8 byte)
-{
-	char bits[9] = { 0 }; // 8 bits + null terminator
-	for (int i = 7; i >= 0; i--) {
-		bits[7 - i] = ((byte >> i) & 1) ? '1' : '0';
-	}
-	pr_info("bits: %s", bits);
-}
-
-/* static void copy_to_mem_list(unsigned long t_arg) */
-/* { */
-/* 	page_node *curr = NULL; */
-/* 	char new_char = ringbuffer_read(&ring_buffer); */
-/* 	/1* print_char(new_char); *1/ */
-/* 	void *virt_addr; */
-
-/* 	// Handle empty list of memory and allocate first page */
-/* 	if (list_empty(&asgn2_device.mem_list)) { */
-/* 		curr = add_page_node(); */
-/* 		if (!curr) { */
-/* 			pr_err("Failed to add initial page node"); */
-/* 			return; */
-/* 		} */
-/* 	} else { */
-/* 		// Get the last page node */
-/* 		curr = list_last_entry(&asgn2_device.mem_list, page_node, list); */
-/* 	} */
-
-/* 	// Check if the current page is full */
-/* 	if (curr->write >= PAGE_SIZE) { */
-/* 		// Allocate a nenlctl -f */
-/* 		// page */
-/* 		curr = add_page_node(); */
-/* 		if (!curr) { */
-/* 			pr_err("Failed to add new page node"); */
-/* 			return; */
-/* 		} */
-/* 	} */
-
-/* 	// Map the page to a virtual address */
-/* 	virt_addr = kmap(curr->page); */
-/* 	if (!virt_addr) { */
-/* 		pr_err("Failed to map page to virtual address"); */
-/* 		return; */
-/* 	} */
-/* 	if (new_char == '\0') { */
-/* 		pr_warn("EOF offset"); */
-/* 		print_lu((curr->write + 1)); */
-/* 		new_char = '\xFF'; */
-/* 		/1* atomic_set(&asgn2_device.data_ready, 1); *1/ */
-/* 		/1* wake_up_interruptible(&asgn2_device.data_queue); *1/ */
-/* 	} */
-
-/* 	// Write the byte to the page */
-/* 	*((char *)virt_addr + curr->write) = new_char; */
-/* 	curr->write++; */
-
-/* 	kunmap(curr->page); */
-
-/* 	// Update the total data size of the device */
-/* 	asgn2_device.data_size++; */
-/* 	/1* print_int(asgn2_device.data_size); *1/ */
-/* } */
-static void write_work_func(struct work_struct *work)
-{
-	struct write_work *w = container_of(work, struct write_work, work);
-	d_list_write(&asgn2_device.dlist, w->value);
-	kfree(w);
-}
 static void copy_to_mem_list(unsigned long t_arg)
 {
+	smp_mb(); // Full memory barrier
 	char new_char = ringbuffer_read(&ring_buffer);
 	asgn2_device.data_size++;
 
@@ -241,15 +173,9 @@ static void copy_to_mem_list(unsigned long t_arg)
 		new_char = SENTINEL;
 		atomic_inc(&asgn2_device.file_count);
 	}
-	struct write_work *work = kmalloc(sizeof(*work), GFP_ATOMIC);
-	if (work) {
-		INIT_WORK(&work->work, write_work_func);
-		work->value = new_char;
-		queue_work(asgn2_device.write_queue, &work->work);
-	} else {
-		pr_err("Failed to allocate memory for write work\n");
-	}
-	/* d_list_write(&asgn2_device.dlist, new_char); */
+
+	d_list_write(&asgn2_device.dlist, new_char);
+
 	smp_mb(); // Full memory barrier
 }
 
