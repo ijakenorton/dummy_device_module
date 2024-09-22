@@ -1,21 +1,26 @@
-TEST_DIR="./test_files"
+#!/bin/bash
 
+TEST_DIR="./test_files"
+if [[ $# -eq 1 ]]; then
+    iterations=$1
+else
+    iterations=5
+fi 
 
 cleanup() {
-    echo "Cleaning up..."
     rm -rf $TEST_DIR
-    rm ./combined.txt
-    rm ./device_output
+    rm -f ./combined.txt
+    rm -f ./device_output
 }
+
 cleanup
-
 mkdir -p $TEST_DIR
-for i in {1..5}; do
-    < /dev/urandom tr -dc 'A-Za-z0-9 ' | head -c 10000 | fold -w 100 > "${TEST_DIR}/file${i}.txt"
+
+for i in $(seq 1 $iterations); do
+    < /dev/urandom tr -dc '~-' | head -c 10000 | fold -w 100 > "${TEST_DIR}/file${i}.txt"
 done
 
-rm ./combined.txt
+> ./combined.txt
 for file in "${TEST_DIR}"/*; do
-        cat "$file" >> "./combined.txt"
+    cat "$file" >> "./combined.txt"
 done
-

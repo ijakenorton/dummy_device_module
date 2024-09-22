@@ -30,21 +30,20 @@ typedef struct {
 
 typedef struct gpio_dev_t {
 	dev_t dev; /* the device */
-struct cdev cdev;
-d_list_t dlist;
-size_t num_pages; /* number of memory pages this module currently holds */
-size_t data_size; /* total data size in this module */
-size_t read_offset;
-atomic_t nprocs; /* number of processes accessing this device */
-atomic_t max_nprocs; /* max number of processes accessing this device */
-atomic_t file_count;
-wait_queue_head_t ptr_overlap_queue;
-struct mutex device_mutex;
-struct kmem_cache *cache; /* cache memory */
-struct class *class; /* the udev class */
-struct device *device; /* the udev device node */
-}
-gpio_dev;
+	struct cdev cdev;
+	d_list_t dlist;
+	size_t num_pages; /* number of memory pages this module currently holds */
+	size_t data_size; /* total data size in this module */
+	size_t read_offset;
+	atomic_t nprocs; /* number of processes accessing this device */
+	atomic_t max_nprocs; /* max number of processes accessing this device */
+	atomic_t file_count;
+	wait_queue_head_t ptr_overlap_queue;
+	struct mutex device_mutex;
+	struct kmem_cache *cache; /* cache memory */
+	struct class *class; /* the udev class */
+	struct device *device; /* the udev device node */
+} gpio_dev;
 
 #define print_fpos(val) pr_info(#val " = %lld", *val)
 int asgn2_major = 0; /* major number of module */
@@ -194,7 +193,7 @@ void d_free_pages_after_first(void)
 // Write function which takes into account the current state of the memory list. This can be treated
 // as a thread safe iterator. It will not create new pages after MAX_PAGE. It also handles some of
 // the cleanup as it makes the concurrency lockless. It does rely on there being only one reader and
-// one writer at a time. If those assumptions are broken the list can end up in a consistent state.
+// one writer at a time. If those assumptions are broken the list can end up in an inconsistent state.
 void d_list_write(d_list_t *dlist, char value)
 {
 	page_node *node;
@@ -291,11 +290,13 @@ write:
 	}
 }
 
-// This is used to peek into to the list to check the current list condition. It returns -EMPTY if
-// the list empty(unread_bytes == 0), -POINTER_OVERLAP if the read and write pointers point to the
-// same place(same page and same position on that page). Returns -MY_EOF if a SENTINEL value is
-// found. Returns 0 for a normal case where it finds an ascii value. This is thread safe assuming
-// the one reader and one writer paradigm. This method handles traversing the circular list.
+/* This is used to peek into to the list to check the current list condition. 
+* Returns 
+*       -EMPTY if the list is empty(unread_bytes == 0)
+*       -POINTER_OVERLAP if the read and write pointers point to the same place(same page and same position on that page).
+*       -MY_EOF if a SENTINEL value is found.
+*       0 if a normal ascii value
+*/
 int d_list_peek(d_list_t *dlist)
 {
 	//shouldnt happen, this should be handled before this point
