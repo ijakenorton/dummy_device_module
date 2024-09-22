@@ -16,42 +16,34 @@
  * as published by the Free Software Foundation; either version
  * 2 of the License, or (at your option) any later version.
  */
-#include "linux/mutex.h"
-#define BUF_SIZE 2000
+
+// Not sure if having includes like this is normal practice, just makes it easier to not include
+// duplicates
+#ifndef kernel_includes_H
+#include "kernel_includes.h"
+#endif /* ifndef kernel_includes_HS */
+//Currently device_operations.c is included this way as it was split just to have files that were
+//easier to work with. I thought about abstracting the d_list implementation, however it is so
+//tightly coupled to the pages it didnt make much sense.
+//
+//Various macro declarations
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
 #define MYIOC_TYPE 'k'
-#include <linux/printk.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/proc_fs.h>
-#include <linux/list.h>
-#include <linux/gpio.h>
-#include <linux/mm.h>
-#include <linux/cdev.h>
-#include <linux/seq_file.h>
-#include <linux/highmem.h>
-#include <linux/interrupt.h>
-#include <linux/version.h>
-#include <linux/delay.h>
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
-#include <asm/switch_to.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/slab.h> // For kmalloc, kfree
-#include <linux/vmalloc.h> // For vmalloc, vfree
-#include <linux/gfp.h>
-#else
-#include <asm/system.h>
-#endif
+#define MIN_PAGE (5)
+#define MAX_PAGE (100000)
+#define EMPTY (1)
+#define POINTER_OVERLAP (2)
+#define MY_EOF (3)
+#define SENTINEL '\0'
+#define READ_BUFFER_SIZE PAGE_SIZE
+#include "device_operations.c"
 
-#include "ring_buffer.h"
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jake Norton");
 MODULE_DESCRIPTION("COSC440 asgn2");
 
 //including like this for now
-#include "device_operations.c"
 #define BCM2835_PERI_BASE 0x3f000000
 
 static u32 gpio_dummy_base;
@@ -158,11 +150,14 @@ static void write_to_gpio(char c)
 	udelay(1);
 }
 
+//State variables for combining the half byte
 static u8 one_byte = 0;
 static bool first_half = true;
 DECLARE_RINGBUFFER(ring_buffer);
 
 // Copies data to circular dynamic linked list one byte at a time
+// Uses the ringbuff_read to get the next byte from the circular buffer.
+// Updates file_count on finding SENTINEL
 static void copy_to_mem_list(unsigned long t_arg)
 {
 	smp_mb(); // Full memory barrier
@@ -170,7 +165,7 @@ static void copy_to_mem_list(unsigned long t_arg)
 	asgn2_device.data_size++;
 
 	if (new_char == '\0') {
-		pr_err("END OF WRITE");
+		//Currently redundant, but was used when the sentinel value was different
 		new_char = SENTINEL;
 		atomic_inc(&asgn2_device.file_count);
 	}
@@ -244,14 +239,14 @@ int __init gpio_dummy_init(void)
 		return ret;
 	}
 	// Create device class
-	pr_info("created chrdev_region\n");
+	pr_debug("created chrdev_region\n");
 	if (IS_ERR(asgn2_device.class = class_create(MYDEV_NAME))) {
 		pr_warn("%s: can't create class\n", MYDEV_NAME);
 		ret = (int)PTR_ERR(asgn2_device.class);
 		goto fail_class_create;
 	}
 
-	pr_info("set up class\n");
+	pr_debug("set up class\n");
 
 	// Create device
 	if (IS_ERR(asgn2_device.device = device_create(asgn2_device.class, NULL,
@@ -262,7 +257,7 @@ int __init gpio_dummy_init(void)
 		goto fail_device_create;
 	}
 
-	pr_info("set up device entry\n");
+	pr_debug("set up device entry\n");
 
 	// Initialise the cdev and add it
 	cdev_init(&asgn2_device.cdev, &asgn2_fops);
@@ -271,7 +266,7 @@ int __init gpio_dummy_init(void)
 		goto fail_cdev_add;
 	}
 
-	pr_info("set up udev entry\n");
+	pr_debug("set up udev entry\n");
 
 	// Create a memory cache for page nodes
 	if (IS_ERR(asgn2_device.cache =
@@ -281,7 +276,7 @@ int __init gpio_dummy_init(void)
 		ret = (int)PTR_ERR(asgn2_device.cache);
 		goto fail_kmem_cache_create;
 	}
-	pr_info("successfully created cache");
+	pr_debug("successfully created cache");
 
 	// Create a proc entry
 	if (IS_ERR(entry = proc_create(MY_PROC_NAME, 0660, NULL,
@@ -290,12 +285,12 @@ int __init gpio_dummy_init(void)
 		ret = (int)PTR_ERR(entry);
 		goto fail_proc_create;
 	}
-	pr_info("Successfully created proc entry");
+	pr_debug("Successfully created proc entry");
 
 	/* Initialise fields */
 	INIT_LIST_HEAD(&asgn2_device.dlist.head);
 	asgn2_device.num_pages = 0;
-	atomic_set(&asgn2_device.dlist.count, 0);
+	atomic_set(&asgn2_device.dlist.unread_bytes, 0);
 	atomic_set(&asgn2_device.nprocs, 0);
 	atomic_set(&asgn2_device.max_nprocs, 1);
 	mutex_init(&asgn2_device.device_mutex);

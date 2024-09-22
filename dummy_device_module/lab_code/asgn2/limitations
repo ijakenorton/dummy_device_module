@@ -1,0 +1,18 @@
+
+Only one reader and one writer at the same time
+
+The only locks involved are within the atomic reads. However atomic reads do happen a lot, which
+will reduce concurrency and performance, however it is necessary for maintaining the internal state
+of the circular list.
+
+Currently the list is only freed when the module is removed or the count is set to zero(this means
+all the data has been read). This means there is potential for the memory to be larger than needed
+if the reads never catch up to the writes. This could be solved by something like a mark and sweep
+garbage collection, where page_nodes that have been read and marked and the garbage collector sweeps
+either on an interval or after a reader releases. I have not tried to do this as it seems to require
+an addition of spinlocks over a lot of operations, or some sort of copying / complex pointer moving
+and saving. This is made more difficult due to the circular nature of the list.
+
+The current implementation will wait indefinitely if there is no data in the device. The waiting is
+interruptible though. I did wonder if it would be useful to have the wait be on a max timer, unsure
+if that makes sense though.

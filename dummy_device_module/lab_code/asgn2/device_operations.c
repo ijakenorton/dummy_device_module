@@ -1,41 +1,17 @@
-
-#include "asm-generic/errno-base.h"
-#define BUF_SIZE 2000
-#include "ring_buffer.h"
+#ifndef kernel_includes_H
+#include "kernel_includes.h"
+#endif /* ifndef kernel_includes_HS */
 #define MYDEV_NAME "asgn2"
 #define MY_PROC_NAME "asgn2_proc"
 #define MYIOC_TYPE 'k'
-#include <linux/printk.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/proc_fs.h>
-#include <linux/gpio.h>
-#include <linux/mm.h>
-#include <linux/cdev.h>
-#include <linux/seq_file.h>
-#include <linux/interrupt.h>
-#include <linux/highmem.h>
-#include <linux/version.h>
-#include <linux/delay.h>
-#include <linux/fs.h>
-#include <linux/uaccess.h>
-#include <linux/mutex.h>
-#include <linux/wait.h>
-#include <linux/list.h>
-
-#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 3, 0)
-#include <asm/switch_to.h>
-#else
-#include <asm/system.h>
-#endif
-
 #define MIN_PAGE (5)
 #define MAX_PAGE (100000)
 #define EMPTY (1)
 #define POINTER_OVERLAP (2)
 #define MY_EOF (3)
 #define SENTINEL '\0'
-char read_buf[PAGE_SIZE] = { 0 };
+#define READ_BUFFER_SIZE PAGE_SIZE
+char read_buf[READ_BUFFER_SIZE] = { 0 };
 typedef struct page_node_rec {
 	struct list_head list;
 	struct page *page;
@@ -49,25 +25,26 @@ typedef struct {
 	struct list_head head;
 	page_node *read;
 	page_node *write;
-	atomic_t count;
+	atomic_t unread_bytes;
 } d_list_t;
 
 typedef struct gpio_dev_t {
 	dev_t dev; /* the device */
-	struct cdev cdev;
-	d_list_t dlist;
-	size_t num_pages; /* number of memory pages this module currently holds */
-	size_t data_size; /* total data size in this module */
-	size_t read_offset;
-	atomic_t nprocs; /* number of processes accessing this device */
-	atomic_t max_nprocs; /* max number of processes accessing this device */
-	atomic_t file_count;
-	wait_queue_head_t ptr_overlap_queue;
-	struct mutex device_mutex;
-	struct kmem_cache *cache; /* cache memory */
-	struct class *class; /* the udev class */
-	struct device *device; /* the udev device node */
-} gpio_dev;
+struct cdev cdev;
+d_list_t dlist;
+size_t num_pages; /* number of memory pages this module currently holds */
+size_t data_size; /* total data size in this module */
+size_t read_offset;
+atomic_t nprocs; /* number of processes accessing this device */
+atomic_t max_nprocs; /* max number of processes accessing this device */
+atomic_t file_count;
+wait_queue_head_t ptr_overlap_queue;
+struct mutex device_mutex;
+struct kmem_cache *cache; /* cache memory */
+struct class *class; /* the udev class */
+struct device *device; /* the udev device node */
+}
+gpio_dev;
 
 #define print_fpos(val) pr_info(#val " = %lld", *val)
 int asgn2_major = 0; /* major number of module */
@@ -75,6 +52,8 @@ int asgn2_minor = 0; /* minor number of module */
 int asgn2_dev_count = 1; /* number of devices */
 struct proc_dir_entry *entry;
 gpio_dev asgn2_device;
+
+// Allocates a number page node using the cache as the memory pool.
 page_node *allocate_node(void)
 {
 	page_node *new_node = kmem_cache_alloc(asgn2_device.cache, GFP_KERNEL);
@@ -97,6 +76,7 @@ page_node *allocate_node(void)
 	return new_node;
 }
 
+//Utility function to calculate node position field
 void update_node_positions(d_list_t *dlist)
 {
 	page_node *node;
@@ -115,7 +95,8 @@ void print_list_structure(d_list_t *dlist)
 	pr_info("Current read node position: %d\n", dlist->read->position);
 	pr_info("Current write node position: %d\n", dlist->write->position);
 	pr_info("List structure: count=%zu, max_size=%lu\n",
-		atomic_read(&dlist->count), asgn2_device.num_pages * PAGE_SIZE);
+		atomic_read(&dlist->unread_bytes),
+		asgn2_device.num_pages * PAGE_SIZE);
 
 	list_for_each(pos, &dlist->head) {
 		node = list_entry(pos, page_node, list);
@@ -124,6 +105,7 @@ void print_list_structure(d_list_t *dlist)
 			node->write_mapped);
 	}
 }
+// Allocate and add a page node at the tail of the list
 page_node *add_page_node(void)
 {
 	page_node *new_node = allocate_node();
@@ -136,6 +118,7 @@ page_node *add_page_node(void)
 	return new_node;
 }
 
+// Free all pages
 void free_memory_pages(void)
 {
 	page_node *curr;
@@ -155,6 +138,8 @@ void free_memory_pages(void)
 	asgn2_device.data_size = 0;
 	asgn2_device.num_pages = 0;
 }
+// Cleanup function, something is not quite right with the logic, don't have time to fix right now
+// so this is on the todo for a way to clean up memory
 void d_free_pages_up_till_read(void)
 {
 	page_node *curr;
@@ -182,6 +167,7 @@ void d_free_pages_up_till_read(void)
 	}
 }
 
+// Basic cleanup function which resets the list down to one page if the list is empty(count == 0)
 void d_free_pages_after_first(void)
 {
 	page_node *curr;
@@ -205,9 +191,14 @@ void d_free_pages_after_first(void)
 	asgn2_device.num_pages = 1;
 }
 
+// Write function which takes into account the current state of the memory list. This can be treated
+// as a thread safe iterator. It will not create new pages after MAX_PAGE. It also handles some of
+// the cleanup as it makes the concurrency lockless. It does rely on there being only one reader and
+// one writer at a time. If those assumptions are broken the list can end up in a consistent state.
 void d_list_write(d_list_t *dlist, char value)
 {
 	page_node *node;
+	//Initialize the list
 	if (list_empty(&dlist->head)) {
 		pr_warn("list is empty");
 		node = allocate_node();
@@ -223,38 +214,30 @@ void d_list_write(d_list_t *dlist, char value)
 		goto write;
 	}
 
-	/* int current_count = atomic_read(&dlist->count); */
 	// Only cleanup if count is < than half of max size
-	if (asgn2_device.num_pages > MIN_PAGE &&
-	    atomic_read(&dlist->count) <
-		    ((asgn2_device.num_pages * (int)PAGE_SIZE) / 2)) {
-		if (atomic_read(&dlist->count) == 0) {
-			pr_warn("Starting free after first GC");
-			d_free_pages_after_first();
-		} else {
-			pr_warn("Starting free till read GC");
-			print_zu(asgn2_device.num_pages);
-
-			d_free_pages_up_till_read();
-		}
-	}
-
 	/* if (asgn2_device.num_pages > MIN_PAGE && */
-	/*     atomic_read(&dlist->count) == 0) { */
-	/* 	pr_warn("Starting GC"); */
-	/* 	print_zu(asgn2_device.num_pages); */
-
-	/* 	node = dlist->write = dlist->read = */
-	/* 		list_first_entry(&dlist->head, page_node, list); */
-
-	/* 	node->write_mapped = node->read_mapped = node->base_address; */
-	/* 	d_free_pages_after_first(); */
+	/*     atomic_read(&dlist->count) < */
+	/* 	    ((asgn2_device.num_pages * (int)PAGE_SIZE) / 2)) { */
+	/* 	pr_warn("Starting free after first GC"); */
+	/* 	d_free_pages_up_till_read(); */
 	/* } */
+
+	if (asgn2_device.num_pages > MIN_PAGE &&
+	    atomic_read(&dlist->unread_bytes) == 0) {
+		pr_warn("Starting GC");
+		print_zu(asgn2_device.num_pages);
+
+		node = dlist->write = dlist->read =
+			list_first_entry(&dlist->head, page_node, list);
+
+		node->write_mapped = node->read_mapped = node->base_address;
+		d_free_pages_after_first();
+	}
 
 	//Assumes we have at least one page
 	if (dlist->write->write_mapped ==
 		    dlist->write->base_address + (int)PAGE_SIZE &&
-	    atomic_read(&dlist->count) !=
+	    atomic_read(&dlist->unread_bytes) !=
 		    asgn2_device.num_pages * (int)PAGE_SIZE) {
 		pr_warn("page is full");
 
@@ -268,15 +251,25 @@ void d_list_write(d_list_t *dlist, char value)
 	}
 
 	//handle case where circular is full, add new node between next and previous node
-	//
-	if (atomic_read(&dlist->count) ==
+	if (atomic_read(&dlist->unread_bytes) ==
 	    asgn2_device.num_pages * (int)PAGE_SIZE) {
-		pr_warn("list is full");
+		if (asgn2_device.num_pages >= MAX_PAGE) {
+			pr_warn("Pages over max page size (%d), not longer appending to list",
+				MAX_PAGE);
+			// Don't want to miss a EOF value, so replace what was there to at least
+			// maintain file boundaries
+			if (value == SENTINEL) {
+				*dlist->write->write_mapped = value;
+			}
+			return;
+		}
 		node = allocate_node();
 		if (!node) {
 			pr_err("Failed to allocate node");
 			return;
 		}
+		// Add node after current write node, this can be anywhere on the list depending on
+		// how the read / write patterns on the device
 		__list_add(&node->list, &dlist->write->list,
 			   dlist->write->list.next);
 
@@ -286,23 +279,27 @@ void d_list_write(d_list_t *dlist, char value)
 write:
 	// ASSERT to catch errors if something went wrong with the state
 	// Can possibly use atomic_read_inc()
-	if (atomic_read(&dlist->count) >
+	if (atomic_read(&dlist->unread_bytes) >
 	    asgn2_device.num_pages * (int)PAGE_SIZE) {
 		pr_err("d_list_write: count exceeded max_size\n");
 		return;
 	}
 	// current page is full, moving to next element and resetting its write pointer
 	*dlist->write->write_mapped++ = value;
-	/* print_zu(dlist->count); */
-	if (atomic_fetch_inc(&dlist->count) == 0) {
+	if (atomic_fetch_inc(&dlist->unread_bytes) == 0) {
 		wake_up_interruptible(&asgn2_device.ptr_overlap_queue);
 	}
 }
 
+// This is used to peek into to the list to check the current list condition. It returns -EMPTY if
+// the list empty(unread_bytes == 0), -POINTER_OVERLAP if the read and write pointers point to the
+// same place(same page and same position on that page). Returns -MY_EOF if a SENTINEL value is
+// found. Returns 0 for a normal case where it finds an ascii value. This is thread safe assuming
+// the one reader and one writer paradigm. This method handles traversing the circular list.
 int d_list_peek(d_list_t *dlist)
 {
 	//shouldnt happen, this should be handled before this point
-	if (atomic_read(&dlist->count) == 0) {
+	if (atomic_read(&dlist->unread_bytes) == 0) {
 		pr_info("Count is zero, cannot read\n");
 		return -EMPTY;
 	}
@@ -329,10 +326,16 @@ int d_list_peek(d_list_t *dlist)
 	return 0;
 }
 
+// This function checks the current read position (dlist->read->read_mapped pointer).This is thread safe assuming
+// the one reader and one writer paradigm. This function should be called after d_list_peek as the
+// peek function checks the list conditions more thoroughly. This function still checks for if the
+// list is empty or a page is full however these are in someways asserts, the peek function should
+// already have handled such cases. Upon successful read, this will move the read->read_mapped
+// pointer forward and decrement unread_bytes
 int d_list_read(d_list_t *dlist, char *value)
 {
 	//shouldnt happen, this should be handled before this point
-	if (atomic_read(&dlist->count) == 0) {
+	if (atomic_read(&dlist->unread_bytes) == 0) {
 		pr_info("Count is zero, cannot read\n");
 		return -EMPTY;
 	}
@@ -349,11 +352,13 @@ int d_list_read(d_list_t *dlist, char *value)
 
 	*value = *dlist->read->read_mapped;
 	dlist->read->read_mapped++;
-	atomic_dec(&dlist->count);
+	atomic_dec(&dlist->unread_bytes);
 
 	return 0;
 }
 
+// Open allows only one process at a time, if more than one process tries to access the device it
+// will wait until the previous device has released.
 int asgn2_open(struct inode *inode, struct file *filp)
 {
 	int ret = mutex_lock_interruptible(&asgn2_device.device_mutex);
@@ -368,9 +373,9 @@ int asgn2_open(struct inode *inode, struct file *filp)
 	// Increment process count (should always be 1 at this point)
 	atomic_inc(&asgn2_device.nprocs);
 
-	return 0; /* success */
+	return 0;
 }
-
+// Releases device mutex, decrements the number of processes(nprocs)
 int asgn2_release(struct inode *inode, struct file *filp)
 {
 	// Decrement process count
@@ -382,6 +387,17 @@ int asgn2_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+// The function called by read() from the user perspective, follows general read conventions. It
+// does however let the user read more than one file if they do not release the file handle after I
+// have returned 0.This is thread safe assuming the one reader and one writer paradigm.
+// This method uses a buffer of constant size(read_buf) to collect the data before transferring it
+// to the user. This allows for no dynamic memory allocation, but does mean there are more calls of
+// copy to user. The buffer is currently PAGE_SIZE in length, but this can be changed by changing
+// the READ_BUFFER_SIZE macro. This approach allows for only one pass through the data, as we do not
+// need to know the length of the current file ahead of time in order to allocate the memory.
+// Currently this returns after the buffer is full. Ideally it would do multiple copy_to_users in
+// the same read call in order to reduce context switching. This is something I will fix, but it is
+// an inefficiency currently.
 ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		   loff_t *f_pos)
 {
@@ -394,18 +410,26 @@ ssize_t asgn2_read(struct file *filp, char __user *buf, size_t count,
 		return 0;
 
 	smp_rmb();
+	// This label is used as a reset if the list is in a non-normal status e.g -EMPTY or
+	// -POINTER_OVERLAP. Instead of handling the cases there, the program reverts back to here
+	// to have a consistent way of interacting with the internal list
 loop_start:
 
-	if (wait_event_interruptible(asgn2_device.ptr_overlap_queue,
-				     atomic_read(&asgn2_device.dlist.count) >
-					     0)) {
+	//The current reader is added to a wait queue if the number of unread_bytes is 0. This is
+	//then woken up by the write to signal it to start reading again and there is data to be
+	//read.
+	if (wait_event_interruptible(
+		    asgn2_device.ptr_overlap_queue,
+		    atomic_read(&asgn2_device.dlist.unread_bytes) > 0)) {
 		return -EINTR;
 	}
 
 	smp_rmb();
-	size_to_read =
-		min((size_t)atomic_read(&asgn2_device.dlist.count), count);
+	size_to_read = min(
+		(size_t)atomic_read(&asgn2_device.dlist.unread_bytes), count);
 
+	// General process, peek first, then act accordingly, if hit an 'Error state' go back to
+	// start of loop and try again, otherwise return if EOF or continue until an 'Error state'
 	while (size_written < size_to_read && size_written < PAGE_SIZE) {
 		switch (d_list_peek(&asgn2_device.dlist)) {
 		case -EMPTY:
@@ -467,8 +491,7 @@ end:
 }
 
 /**
- * This function writes from the user buffer to the virtual disk of this
- * module
+ * This is a read-only device from the user point of view.
  */
 ssize_t asgn2_write(struct file *filp, const char __user *buf, size_t count,
 		    loff_t *f_pos)
@@ -489,6 +512,8 @@ long asgn2_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
 
 	/*  get command, and if command is TEM_SET_NPROC, then get the data, and */
 	/*  set max_nprocs accordingly, */
+	// The number of processes can be changed, but this is just to show IOCTL potential. For now
+	// the max_nprocs isn't really relevant as there can only be one anyway
 	switch (cmd) {
 	case TEM_SET_NPROC:
 		if (!access_ok((void __user *)arg,
@@ -530,6 +555,9 @@ static void my_seq_stop(struct seq_file *s, void *v)
 	/* There's nothing to do here! */
 }
 
+// Can be polled to keep track of the current state of the list
+// asgn2_device.data_size is a non_atomic version of unread_bytes, it also is a way to see how many
+// total files have been read, as it does not decrement on file release
 int my_seq_show(struct seq_file *s, void *v)
 {
 	//Now that count is atomic might not be ideal to poll this...
@@ -537,7 +565,7 @@ int my_seq_show(struct seq_file *s, void *v)
 		s,
 		"Pages: %d\nMemory: %zu bytes\nCount: %zu\nRead offset %d\nDevices: %d\n",
 		asgn2_device.num_pages, asgn2_device.data_size,
-		atomic_read(&asgn2_device.dlist.count),
+		atomic_read(&asgn2_device.dlist.unread_bytes),
 		atomic_read(&asgn2_device.file_count),
 		atomic_read(&asgn2_device.nprocs));
 	return 0;
