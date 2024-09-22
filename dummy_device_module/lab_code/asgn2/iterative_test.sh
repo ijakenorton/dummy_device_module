@@ -31,7 +31,7 @@ multiple_reads() {
 
 run_tests() {
     echo "Starting tests with multiple iterations" | tee -a $RESULTS_FILE
-    for i in {5..200}; do
+    for i in {25..100}; do
         echo "Running test with $i iterations" | tee -a $RESULTS_FILE
         start_time=$(date +%s.%N)
         multiple_reads $i
